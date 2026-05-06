@@ -1,0 +1,576 @@
+# sluice reference
+
+Complete syntax and semantics. For an introduction and tutorial, see
+[README.md](README.md).
+
+- [Rule file syntax](#rule-file-syntax)
+- [`defaults:` attributes](#defaults-attributes)
+- [Per-rule attributes](#per-rule-attributes)
+- [Slot system](#slot-system)
+- [Path templates](#path-templates)
+- [Audit](#audit)
+- [Log policy](#log-policy)
+- [`exec_path`](#exec_path)
+- [Wire protocol](#wire-protocol)
+- [CLI](#cli)
+- [Error codes](#error-codes)
+- [Production checklist](#production-checklist)
+
+---
+
+## Rule file syntax
+
+Line-oriented, whitespace-significant.
+
+- `;` starts a comment to end of line. Quote-aware: a `;` inside a
+  single- or double-quoted literal is data, not a comment.
+- Blank lines separate stanzas; otherwise meaningless.
+- An **unindented** line is a stanza header — either the literal
+  `defaults:` or a *rule line*.
+- An **indented** line (any leading whitespace) is an attribute of the
+  preceding stanza, written `key = value`.
+
+A rule line is a literal command line, tokenised shell-style:
+
+- Whitespace separates tokens.
+- `'…'` and `"…"` quote a token (the quotes don't appear in the
+  matched argument).
+- `\x` escapes the next byte inside a `"…"` literal or anywhere outside
+  quotes.
+- The first token is the executable. Bare names go through
+  [`exec_path`](#exec_path) at call time. Absolute paths must start
+  with `/`.
+- Subsequent tokens are either *literals* or *slots* (see
+  [Slot system](#slot-system)).
+
+Example:
+
+```
+defaults:
+  timeout = 30s
+  env     = HOME,PATH,LANG
+
+git -C /home/agent/work log --oneline -n #1
+  1 = ^[1-9][0-9]?$
+
+/bin/sh -c 'set -e; date; uptime'      ; quoted ';' is literal
+```
+
+---
+
+## `defaults:` attributes
+
+All attributes are optional. Defaults marked **(default-strict)** matter
+when `audit = strict` (which is itself the default).
+
+| attribute    | scope            | default                                | summary                                              |
+|--------------|------------------|----------------------------------------|------------------------------------------------------|
+| `timeout`    | defaults + rule  | (none)                                 | Wall-clock kill (`SIGTERM` then `SIGKILL` after 2s)  |
+| `cwd`        | defaults + rule  | broker's cwd                           | Child working directory                              |
+| `env`        | defaults + rule  | `none`                                 | Environment allowlist                                |
+| `log`        | defaults + rule  | `full`                                 | Verbosity policy for the audit manifest              |
+| `logfile`    | defaults only    | (none)                                 | JSONL audit manifest path                            |
+| `stdoutfile` | defaults + rule  | (none)                                 | Per-call raw stdout sidecar path template            |
+| `stderrfile` | defaults + rule  | (none)                                 | Per-call raw stderr sidecar path template            |
+| `audit`      | defaults only    | `strict`                               | What to do on audit failure                          |
+| `exec_path`  | defaults + rule  | `/bin:/usr/bin:/sbin:/usr/sbin`        | Bare-name executable lookup path                     |
+
+### `timeout = <duration>`
+
+Wall-clock cap on the spawned child. The child is `setpgid`'d into its
+own process group; on timeout the broker `killpg`s the group with
+`SIGTERM`, waits 2 seconds, then `SIGKILL`s — so most grandchildren are
+caught too.
+
+Format: `<n>(ms|s|m|h)`. Bare number = seconds.
+
+```
+timeout = 30s
+timeout = 5m
+timeout = 250ms
+```
+
+When the timeout fires, the wire reply is `ERR_SIGNALED` (-5) and the
+manifest exit event records the elapsed time.
+
+### `cwd = <path>`
+
+Absolute path. Child `chdir`s here just before `execve`. If the path
+doesn't exist or isn't traversable, the child exits 126 immediately.
+
+### `env = <policy>`
+
+Allowlist of environment variables inherited from the broker. Two
+forms:
+
+- `env = none` — empty environment (besides what `exec_path` injects;
+  see below).
+- `env = NAME1,NAME2,…` — these names are inherited from the broker if
+  they're set; missing ones are simply omitted.
+
+Variable names must match `^[A-Z_][A-Z0-9_]*$`-ish (alphanumeric +
+underscore, not starting with a digit). Bad names are rejected at parse
+time.
+
+`PATH` is special: the value injected by [`exec_path`](#exec_path)
+overrides any `PATH` produced by `env` allowlisting.
+
+### `log = full | argv-only | exit-only`
+
+Controls what the audit manifest records and whether stdio is teed.
+See [Log policy](#log-policy) for full semantics.
+
+### `logfile = <path-template>`
+
+Path to the JSONL audit manifest. **Defaults level only** — there's
+one shared manifest. The path is opened once at startup (and re-opened
+on `SIGHUP`).
+
+Path can contain system slots, but per-call slots (`#$call`) don't
+make sense here — operators wanting per-call audit use
+`stdoutfile`/`stderrfile`. Useful slots in the manifest path: `#$ts`
+for daily-stamped manifests, or none.
+
+Created with mode `0600`. The parent dir must be owner-only and
+non-writable to others (the broker rejects open if the parent is
+group/world-writable). `O_NOFOLLOW` rejects symlink races at the leaf.
+
+### `stdoutfile`, `stderrfile = <path-template>`
+
+Per-call raw stdio capture. The bytes are byte-identical to what the
+child wrote — no UTF-8 decode, no buffering, no escaping. Standard
+tools (`cat`, `grep`, `jq`, `tail -f`) work directly.
+
+Templates support all [system slots](#path-templates). Use `#$call`
+(or `#$ts_ms`) to ensure each call lands in a unique file.
+
+Same hardening as `logfile` (mode 0600, `O_NOFOLLOW`, owner-only
+parent).
+
+When neither `stdoutfile` nor `stderrfile` is set, sluice uses the
+**direct** spawn path — caller's fds are `dup2`'d straight onto the
+child's 0/1/2, no userspace copy. When at least one is set, sluice
+interposes pipes and runs relay threads to tee.
+
+### `audit = strict | best-effort`
+
+How the broker reacts to audit failure. See [Audit](#audit) for the
+full matrix.
+
+### `exec_path = <colon-list> | inherit`
+
+Where bare-name rules look up the executable. See
+[`exec_path`](#exec_path).
+
+---
+
+## Per-rule attributes
+
+Each rule's stanza accepts the same attributes as `defaults:` (with the
+`logfile` exception), plus per-slot regexes.
+
+```
+git log -n #count
+  count = ^[1-9][0-9]?$       ; per-slot regex (numeric slot #1)
+  timeout = 5s                ; rule override
+  env     = HOME,LANG,PAGER   ; rule override
+  log     = exit-only         ; rule override
+  stdoutfile = /home/agent/.local/state/sluice/git/c#$call.out
+```
+
+### Per-slot regex
+
+Indented lines whose key is a slot identifier (a number `1..N` or a
+named slot like `count`) attach a regex constraint to that slot. The
+regex is **anchored implicitly** — sluice wraps with `^…$` if you
+didn't.
+
+Slot values exceeding 4 KB are rejected unconditionally.
+
+If no regex is given, the only constraint is the 4 KB length cap.
+
+### Reserved attribute names
+
+The keys `timeout`, `cwd`, `env`, `log`, `logfile`, `stdoutfile`,
+`stderrfile`, `exec_path` cannot be used as named slots. Use a
+different slot name.
+
+---
+
+## Slot system
+
+A slot is a token of the form `#<id>` where `<id>` is either:
+
+- a positive integer `#1`, `#2`, … — *numeric slot*
+- an alphanumeric identifier `#path`, `#unit`, `#dst` — *named slot*
+
+Slots can only be **whole tokens** — a slot inside a literal string
+(e.g. `s3://#bucket/key`) is not parsed as a slot. Wrap the whole token
+as a slot instead and constrain it via regex.
+
+A rule cannot have two slots with the same id.
+
+Caller-supplied values are filled positionally; arity is checked
+exactly (the rule's token count must equal `argv.len() - 1`).
+
+---
+
+## Path templates
+
+The values for `logfile`, `stdoutfile`, `stderrfile` are *path
+templates* — strings with `#$<system-slot>` placeholders substituted
+at call time.
+
+| slot      | resolves to                                    |
+|-----------|------------------------------------------------|
+| `#$call`  | broker monotonic call id (1, 2, …)             |
+| `#$pid`   | caller pid (`SO_PEERCRED`)                     |
+| `#$uid`   | caller uid                                     |
+| `#$rule`  | matched rule's line number in the rules file   |
+| `#$ts`    | unix epoch seconds at call start               |
+| `#$ts_ms` | unix epoch milliseconds at call start          |
+
+Unknown slots are rejected at parse time. To put a literal `#$` in a
+path, use a different naming scheme — there's no escape.
+
+A path containing `#$call` (or `#$ts_ms`) is unique per call.
+Concurrent appends to the same resolved path are still serialised
+through a per-path mutex, so non-unique paths (e.g.
+`~/.local/state/sluice/by-pid/#$pid.log`) are safe — sequential calls
+from the same pid concatenate cleanly.
+
+---
+
+## Audit
+
+`audit = strict` (default) refuses to operate when the configured audit
+can't be honored. `audit = best-effort` downgrades to warnings.
+
+| condition                                                | strict                    | best-effort               |
+|----------------------------------------------------------|---------------------------|---------------------------|
+| Socket parent dir writable by another uid                | refuse start              | warn + start              |
+| `logfile` path is a symlink                              | refuse open               | refuse open               |
+| `logfile` parent group/world-writable                    | refuse open               | refuse open               |
+| `logfile` initial open fails (perms, ENOSPC, …)          | refuse start              | refuse start              |
+| `stdoutfile`/`stderrfile` open fails at call time        | reject call (`ERR_AUDIT`) | log + run with no sink    |
+| `stdoutfile`/`stderrfile` parent unsafe                  | reject call               | log + run                 |
+| Manifest start event write fails (mid-run, transient)    | reject call               | log + run                 |
+| Manifest already-unhealthy on next call                  | reject call               | log + run                 |
+| Sink write fails mid-call                                | mark unhealthy + `truncated:true` on exit; **next** call refused | log to stderr; `truncated:true` on exit |
+| Manifest exit / reject event write fails                 | log to stderr             | log to stderr             |
+
+The "manifest already-unhealthy" check uses an internal flag that
+flips false on any write/flush failure (manifest or sink) and never
+recovers without `SIGHUP` (which constructs a fresh `Logger` for the
+same path).
+
+A failed sink write does **not** count toward `stdout_bytes` /
+`stderr_bytes` — those reflect what's on disk, not what was
+attempted. The exit event additionally carries `"truncated":true`
+when at least one sink lost bytes during the call:
+
+```jsonl
+{"call":7,"ts":...,"kind":"exit","status":0,"duration_ms":42,
+ "stdout_bytes":1024,"stderr_bytes":0,"truncated":true}
+```
+
+Find them with `jq 'select(.truncated)'`. The field is omitted on
+clean calls to keep common-case lines shorter.
+
+---
+
+## Log policy
+
+Three levels controlling what enters the manifest. Independent of, and
+in addition to, sink configuration.
+
+| `log =`     | `start` event | `exit` event | stdio tee'd to sinks? |
+|-------------|---------------|--------------|------------------------|
+| `full`      | yes (with argv) | yes        | yes (if sinks set)     |
+| `argv-only` | yes (with argv) | yes        | **no** (sinks ignored) |
+| `exit-only` | **no**          | yes        | **no** (sinks ignored) |
+
+`exit-only` is the most-redacted mode: the manifest records `{call,
+ts, kind:"exit", status, duration_ms, stdout_bytes:0, stderr_bytes:0}`
+with no argv. Useful when argv may carry secrets you don't want
+captured but you still need an audit trail of "this call happened".
+
+Reject events are emitted in all three modes (a denied call is
+security-relevant); argv is suppressed under `exit-only` only.
+
+---
+
+## `exec_path`
+
+Where bare-name rules resolve to an absolute path. Resolution happens
+in the broker (Rust code) — `execve` is then called with the absolute
+path, so an attacker on the broker's `PATH` can't redirect lookup.
+
+### Default
+
+```
+exec_path = /bin:/usr/bin:/sbin:/usr/sbin
+```
+
+These are root-owned and not user-writable on a normal Linux system.
+
+### Custom list
+
+```
+exec_path = /opt/agent/bin:/usr/local/bin:/bin:/usr/bin
+```
+
+Each entry must be an absolute path. Empty entries (e.g. a stray
+trailing `:`) and relative entries are rejected at parse time — both
+expose the executable resolution to the caller's CWD.
+
+### `inherit`
+
+```
+exec_path = inherit
+```
+
+Use the broker process's `PATH` at exec time. Useful for development;
+discouraged in production because it pulls operator habits (custom
+PATH entries) into the broker's threat model.
+
+### Per-rule override
+
+A rule can override `exec_path` for its own lookup:
+
+```
+deploy #env
+  env = ^(staging|prod)$
+  exec_path = /opt/deploy/bin
+```
+
+### Effect on the child's environment
+
+The resolved path is also written into the child's `PATH` env var
+(overriding any `PATH` produced by `env` allowlisting), so any sub-shell
+spawned by the child sees the same lookup path as sluice used.
+
+---
+
+## Wire protocol
+
+Transport: `AF_UNIX` `SOCK_SEQPACKET`. One request, one reply. Both
+fit in a single message — no length-prefixed reassembly.
+
+### Request
+
+The caller sends one message containing the payload below, with three
+fds (stdin, stdout, stderr) attached as `SCM_RIGHTS` ancillary data.
+
+```
+u32 magic        = 0x534C4358   ("SLCX", little-endian)
+u32 version      = 1
+u32 argv_count   ; 1..=256
+for each arg:
+    u32  byte_len    ; 0..=16384
+    u8[byte_len]     ; UTF-8, no embedded NUL
+
+ancillary: SCM_RIGHTS = [stdin_fd, stdout_fd, stderr_fd]
+```
+
+Maximum total payload: 1 MiB.
+
+### Reply
+
+```
+u32 magic        = 0x534C4358
+u32 version      = 1
+i32 status
+```
+
+Status interpretation:
+
+| value                  | meaning                                                 |
+|------------------------|---------------------------------------------------------|
+| `0..=255`              | child's exit code (clamped)                             |
+| `-1` (`ERR_NO_RULE`)   | no rule matched (or regex rejected slot)                |
+| `-2` (`ERR_PROTO`)     | protocol error or recv timeout                          |
+| `-3` (`ERR_FDS`)       | wrong fd count (≠ 3 attached)                           |
+| `-4` (`ERR_SPAWN`)     | fork/exec failed                                        |
+| `-5` (`ERR_SIGNALED`)  | child died from a signal (incl. timeout SIGKILL)        |
+| `-6` (`ERR_AUDIT`)     | audit refused under strict mode                         |
+
+The bundled clients (`sluicify`, `sluicify.py`) translate negative
+status to exit `128 + |status|` so shell pipelines can branch on it.
+
+### See also
+
+`src/proto.rs` is the canonical spec — short, unit-tested.
+
+---
+
+## CLI
+
+### `sluice check <rules-file>`
+
+Parse the file, report rule count and exe shape per rule. Returns 0 on
+success, 1 on parse error.
+
+```sh
+$ sluice check ~/.config/sluice/agent.rules
+ok: 5 rule(s)
+  line  10: BareName("git")  tokens=4  slots=1
+  ...
+```
+
+### `sluice match <rules-file> <argv...>`
+
+Match an argv against the rules without running anything. Returns 0
+and prints the matching rule and slot bindings, or 1 if no match.
+
+```sh
+$ sluice match ~/.config/sluice/agent.rules git -C ~/work add src/main.rs
+match: rule at line 10
+  #path = "src/main.rs"
+```
+
+### `sluice serve --rules <file> --socket <path>`
+
+Run the broker. Both flags are required; both should be absolute paths.
+
+The broker:
+
+- Refuses to start if the socket parent dir is writable by another uid
+  (under strict; warns under best-effort).
+- Removes a stale socket *file*, but refuses to overwrite a non-socket
+  at the path.
+- Binds with `umask 0077` so the socket file is mode 0600.
+- `SIGHUP` → reload rules + reopen manifest + clear sink cache.
+- Exits with code 2 on configuration error, runs forever otherwise.
+
+#### User-level systemd unit (laptop / dev workstation)
+
+`~/.config/systemd/user/sluice.service`:
+
+```ini
+[Unit]
+Description=sluice — coding agent broker
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sluice serve \
+    --rules  %h/.config/sluice/agent.rules \
+    --socket %t/sluice/agent.sock
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user enable --now sluice`. No system-level
+privileges, no root, no dedicated uid. (`%h` = `$HOME`,
+`%t` = `$XDG_RUNTIME_DIR`.)
+
+#### System-level systemd unit (multi-tenant / shared host)
+
+When the broker must run as a separate uid (CI runners, shared
+servers), use a system unit at `/etc/systemd/system/sluice.service`:
+
+```ini
+[Unit]
+Description=sluice command broker for the agent sandbox
+After=network.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+ExecStart=/usr/local/sbin/sluice serve \
+    --rules  /etc/sluice/agent.rules \
+    --socket /var/lib/sluice/agent.sock
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sluice /var/log/sluice
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `agent` uid, `/etc/sluice/`, `/var/lib/sluice/`, and
+`/var/log/sluice/` must all exist with mode 0700, owned by
+`agent:agent`. See the [Production checklist](#production-checklist).
+
+---
+
+## Error codes
+
+See [Wire protocol](#wire-protocol) for the negative status codes
+returned by the broker. Process exit codes from the bundled clients
+follow the convention `128 + |sluice_error|`:
+
+| broker status | sluicify exit code | meaning                       |
+|---------------|--------------------|-------------------------------|
+| `0`           | `0`                | child exited 0                |
+| `1..=255`     | `1..=255`          | child's exit code             |
+| `-1`          | `129`              | no matching rule              |
+| `-2`          | `130`              | protocol error / recv timeout |
+| `-3`          | `131`              | wrong fd count                |
+| `-4`          | `132`              | spawn failure                 |
+| `-5`          | `133`              | child died from signal        |
+| `-6`          | `134`              | audit refused (strict)        |
+
+---
+
+## Production checklist
+
+This list is for **multi-tenant / shared-host deployment** — sluice
+running as a dedicated system uid serving sandboxes belonging to
+other users or to the system. For single-user laptop / dev-workstation
+deployment, the checklist collapses to: follow the
+[README tutorial](README.md), and the user-land paths (`~/.config/sluice/`,
+`~/.local/state/sluice/`, `$XDG_RUNTIME_DIR/sluice/`) handle the perms
+correctly without further ceremony.
+
+For shared-host deployment, before going live, verify:
+
+- [ ] Broker runs as a dedicated **unprivileged** user. Never run as root.
+- [ ] Socket parent dir owned by that user, mode `0700` (e.g.
+      `/var/lib/sluice` owned `agent:agent`).
+- [ ] Audit dirs (`logfile` parent and any `stdoutfile`/`stderrfile`
+      ancestor) owned by the broker user, mode `0700` (e.g.
+      `/var/log/sluice`).
+- [ ] Rules file owned by the broker user, mode `0600` or `0640` (e.g.
+      `/etc/sluice/agent.rules`).
+- [ ] `exec_path` is **explicit** (not `inherit`). The default is good
+      for most cases.
+- [ ] `audit = strict` (the default — don't change without a reason).
+- [ ] Every slot has a regex constraint, no matter how trivially
+      "obvious". Slots without regex accept any 4 KB blob.
+- [ ] Rules are tested with `sluice check` and a representative set of
+      `sluice match` invocations.
+- [ ] `logrotate` configured for the manifest. Sluice reopens on
+      `SIGHUP`; standard `postrotate { kill -HUP $MAINPID }` works.
+- [ ] System-level systemd unit (or equivalent) restarts the broker on
+      crash. `Restart=on-failure` + `NoNewPrivileges=true`. See the
+      [System-level systemd unit](#system-level-systemd-unit-multi-tenant--shared-host)
+      example.
+- [ ] If the sandbox technology supports it, also set seccomp
+      filters/landlock on the broker process — sluice has no business
+      calling `mount`, `ptrace`, etc.
+- [ ] The bind-mount of the socket into the sandbox should be the
+      *only* path between the two; verify nothing else leaks (no
+      shared `/tmp`, no inherited fds).
+
+### Threats sluice does NOT mitigate
+
+- A child process that legitimately backgrounds work outliving its
+  parent (e.g. `nohup`, `disown`). Timeout-driven kill catches the
+  process tree it spawned, but a child that intentionally `setsid`s to
+  detach escapes `killpg`. Use cgroup containment if your threat model
+  requires this.
+- Co-resident attackers who can write to ancestors of the audit
+  directory (e.g. `/var/log` is group-writable to a group you share).
+  The broker checks the *immediate* parent only; full ancestor walk
+  via `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)` is not
+  implemented. Pin your audit ancestry to root-owned dirs.
+- Kernel exploits, container escapes, and side channels in the
+  binaries the rules invoke. sluice is a policy gate — once a rule
+  fires, the binary's own behavior is what you trust.

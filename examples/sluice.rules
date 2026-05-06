@@ -1,0 +1,72 @@
+; Example sluice rule file.
+;
+; Format:
+;   - One file per sandbox = one socket per sandbox. Identity is the
+;     socket; the file is the whitelist.
+;   - A rule is literally a command line with `#1 #2 …` or `#name`
+;     slots filled by the caller's argv.
+;   - Indented lines below a rule attach either a per-slot regex
+;     (anchored ^…$) or a control attribute:
+;         timeout cwd env log
+;         logfile stdoutfile stderrfile
+;   - Comments use ';' — quote-aware, so a ';' inside a '…' or "…"
+;     literal is data, not a comment.
+;   - First match wins.
+;
+; Audit:
+;   - logfile     — JSONL manifest of structured events (start, exit,
+;                   reject). One shared timeline. Optional.
+;   - stdoutfile  — raw stdout bytes, byte-identical to upstream.
+;   - stderrfile  — raw stderr bytes.
+;
+; Path templates substitute these slots at call time:
+;     #$call   broker monotonic call id (1, 2, …)
+;     #$pid    caller pid (from SO_PEERCRED)
+;     #$uid    caller uid
+;     #$rule   matched rule's line number
+;     #$ts     unix epoch seconds
+;     #$ts_ms  unix epoch milliseconds
+;
+; A path that contains #$call (or #$ts_ms) is unique per call, so the
+; resulting files are pure byte streams that any standard tool — cat,
+; grep, jq, csv — parses unchanged.
+
+defaults:
+  timeout    = 30s
+  env        = HOME,PATH,LANG
+
+  ; Structured audit events. Single shared file, append-only.
+  logfile    = /var/log/sluice/manifest.jsonl
+
+  ; Per-call raw stdio capture. The caller still sees stdio at its own
+  ; terminal — these are byte-identical sidecar files for audit.
+  stdoutfile = /var/log/sluice/by-pid/#$pid/c#$call.out
+  stderrfile = /var/log/sluice/by-pid/#$pid/c#$call.err
+
+; --- local, current uid -----------------------------------------------------
+
+git -C /var/repos/main log --oneline -n #1
+  1 = ^[1-9][0-9]?$
+
+; --- elevated via sudo (sudoers decides whether sudo lets it through) -------
+
+sudo -u ops rsync -a #src #dst
+  src = ^[a-zA-Z0-9._/-]+$
+  dst = ^[a-zA-Z0-9._/-]+$
+  timeout = 300s
+  ; Per-rule override: dump bulky rsync output into a dedicated tree.
+  stdoutfile = /var/log/sluice/rsync/#$ts_ms.out
+  stderrfile = /var/log/sluice/rsync/#$ts_ms.err
+
+; --- remote via ssh (authorized_keys decides whether ssh lets it through) ---
+
+ssh -o BatchMode=yes hostY systemctl status #unit
+  unit = ^[a-zA-Z0-9_.-]+\.service$
+
+; --- absolute path, no slots ------------------------------------------------
+
+/usr/bin/systemctl status nginx
+
+; --- quoted literal containing ';' (comment-stripping is quote-aware) -------
+
+/bin/sh -c 'set -e; date; uptime'

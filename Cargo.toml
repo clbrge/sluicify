@@ -1,0 +1,30 @@
+[package]
+name = "sluicify"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Christophe Le Bars <clb@toort.net>"]
+description = "AF_UNIX command broker with declarative whitelist and fd-passing. Ships the `sluice` daemon and the `sluicify` client."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/clbrge/sluicify"
+homepage = "https://github.com/clbrge/sluicify"
+readme = "README.md"
+keywords = ["sandbox", "ipc", "afunix", "audit", "broker"]
+categories = ["command-line-utilities", "os::linux-apis"]
+exclude = ["/node", "/.github", "/.gitignore"]
+
+# The crate is named after the verb (the user-facing client),
+# but src/main.rs is the daemon. Override the default-bin name.
+[[bin]]
+name = "sluice"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+clap  = { version = "4", features = ["derive"] }
+nix   = { version = "0.29", features = ["socket", "process", "fs", "signal", "user", "uio"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
