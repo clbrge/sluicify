@@ -9,6 +9,15 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Changed
+
+- README and REFERENCE: new "Auditing rules" section — how a rule ends up
+  granting more than intended, with counter-examples and a per-rule
+  procedure to follow before a rule goes live.
+- The README tutorial and `examples/sluice.rules` use only closed rules:
+  none runs a file the caller can write, and `git` and `systemctl` run
+  with `--no-pager`.
+
 ## [0.2.0] - 2026-10-05
 
 ### Upgrading
