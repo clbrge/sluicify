@@ -9,6 +9,8 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
 ### Upgrading
 
 - Every slot needs a regex or an `allow_any` entry; a rules file with a
@@ -170,5 +172,6 @@ Initial public release. The crate ships two binaries (`sluice` daemon and
 - 56 Rust tests (48 unit + 5 integration + 3 example smoke) + manual
   Node smoke.
 
-[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/clbrge/sluicify/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/clbrge/sluicify/releases/tag/v0.1.0
