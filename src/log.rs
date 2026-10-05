@@ -27,6 +27,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Copy, Clone)]
 pub struct CallId(pub u64);
 
+pub struct ExitEvent {
+    pub status: i32,
+    /// Until the direct child exited; output drain afterwards excluded.
+    pub duration_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// At least one stdio sink lost bytes (the child wrote more than
+    /// landed on disk).
+    pub truncated: bool,
+    /// Output capture stopped at the rule's timeout plus kill grace
+    /// while a descendant still held stdout or stderr open.
+    pub drain_timeout: bool,
+}
+
 pub struct Logger {
     file: Mutex<File>,
     /// Cleared on first write/flush failure; never auto-recovers.
@@ -84,31 +98,26 @@ impl Logger {
         self.append_line(&s)
     }
 
-    /// `truncated` is true when at least one stdio sink lost bytes
-    /// during the call (the child wrote more than landed on disk). The
-    /// field is emitted only when set — common successful calls keep
-    /// the line shorter and JSONL consumers can `select(.truncated)`
-    /// to find audit gaps without a numeric comparison.
-    pub fn exit(
-        &self,
-        call: CallId,
-        status: i32,
-        duration_ms: u64,
-        stdout_bytes: u64,
-        stderr_bytes: u64,
-        truncated: bool,
-    ) {
+    /// `truncated` and `drain_timeout` are emitted only when set —
+    /// common successful calls keep the line shorter and JSONL
+    /// consumers can `select(.truncated)` to find audit gaps without a
+    /// numeric comparison.
+    pub fn exit(&self, call: CallId, e: &ExitEvent) {
         let mut s = String::with_capacity(96);
         s.push('{');
         emit_meta(&mut s, call, "exit");
         write!(
             s,
-            ",\"status\":{status},\"duration_ms\":{duration_ms}\
-             ,\"stdout_bytes\":{stdout_bytes},\"stderr_bytes\":{stderr_bytes}"
+            ",\"status\":{},\"duration_ms\":{}\
+             ,\"stdout_bytes\":{},\"stderr_bytes\":{}",
+            e.status, e.duration_ms, e.stdout_bytes, e.stderr_bytes
         )
         .unwrap();
-        if truncated {
+        if e.truncated {
             s.push_str(",\"truncated\":true");
+        }
+        if e.drain_timeout {
+            s.push_str(",\"drain_timeout\":true");
         }
         s.push('}');
         let _ = self.append_line(&s);
@@ -308,7 +317,7 @@ mod tests {
             Some(&stdout_p),
             Some(&stderr_p),
         );
-        logger.exit(c, 0, 7, 6, 0, false);
+        logger.exit(c, &exit_event(0, 6, false, false));
         drop(logger);
 
         let mut s = String::new();
@@ -321,6 +330,36 @@ mod tests {
         assert!(lines[1].contains("\"kind\":\"exit\""));
         assert!(lines[1].contains("\"status\":0"));
         assert!(lines[1].contains("\"stdout_bytes\":6"));
+        cleanup(&p);
+    }
+
+    fn exit_event(
+        status: i32,
+        stdout_bytes: u64,
+        truncated: bool,
+        drain_timeout: bool,
+    ) -> ExitEvent {
+        ExitEvent {
+            status,
+            duration_ms: 7,
+            stdout_bytes,
+            stderr_bytes: 0,
+            truncated,
+            drain_timeout,
+        }
+    }
+
+    #[test]
+    fn exit_drain_timeout_field_only_when_true() {
+        let p = temp_path();
+        let logger = Logger::open(&p).unwrap();
+        logger.exit(CallId(1), &exit_event(0, 3, false, false));
+        logger.exit(CallId(2), &exit_event(0, 3, false, true));
+        drop(logger);
+        let s = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(!lines[0].contains("drain_timeout"));
+        assert!(lines[1].contains("\"drain_timeout\":true"));
         cleanup(&p);
     }
 
@@ -341,8 +380,8 @@ mod tests {
     fn exit_truncated_field_only_when_true() {
         let p = temp_path();
         let logger = Logger::open(&p).unwrap();
-        logger.exit(CallId(1), 0, 5, 100, 0, false);
-        logger.exit(CallId(2), 0, 5, 50, 0, true);
+        logger.exit(CallId(1), &exit_event(0, 100, false, false));
+        logger.exit(CallId(2), &exit_event(0, 50, true, false));
         drop(logger);
         let s = std::fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = s.lines().collect();

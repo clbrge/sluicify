@@ -32,6 +32,11 @@ breaking changes (and will be called out under **Changed** with a note).
 - Received fds are marked close-on-exec atomically
   (`MSG_CMSG_CLOEXEC`), so a concurrent spawn can't inherit another
   caller's stdio.
+- With `stdoutfile`/`stderrfile`, the reply no longer waits for
+  background processes that hold the child's stdout/stderr; it goes out
+  when the child exits, as in direct mode. Capture continues until they
+  close the pipe or until the rule's timeout + 2 s, and the exit event
+  is written then (`"drain_timeout":true` when cut).
 - Spawned children start with an empty signal mask and default
   `SIGPIPE`; they previously inherited `SIGHUP` blocked and `SIGPIPE`
   ignored.

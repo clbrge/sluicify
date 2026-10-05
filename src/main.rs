@@ -15,13 +15,13 @@ use nix::sys::socket::{
     ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use nix::sys::time::TimeVal;
-use sluicify::log::{open_raw, CallId, Logger};
+use sluicify::log::{open_raw, CallId, ExitEvent, Logger};
 use sluicify::peer::peer_of;
 use sluicify::proto::{
     decode_request, encode_reply, Request, ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PROTO, MAX_PAYLOAD,
 };
 use sluicify::rules::{self, AuditMode, LogPolicy, PathCtx, PathTemplate, Rules};
-use sluicify::spawn::{run_matched, SpawnCtx, SpawnOutcome, TeeSink};
+use sluicify::spawn::{run_matched, Drain, Drained, SpawnCtx, SpawnOutcome, TeeSink};
 
 #[derive(Parser)]
 #[command(name = "sluice", version, about = "AF_UNIX command broker")]
@@ -468,11 +468,17 @@ fn handle_conn(
                     }
                     ERR_NO_RULE
                 }
-                Some(m) => dispatch(m.rule, &snap, &req, stdio, &conn, &sinks, &call_counter),
+                Some(m) => {
+                    return dispatch(m.rule, &snap, &req, stdio, &conn, &sinks, &call_counter)
+                }
             },
         },
         Err(()) => ERR_PROTO,
     };
+    send_reply(&conn, status);
+}
+
+fn send_reply(conn: &OwnedFd, status: i32) {
     let reply = encode_reply(status);
     let _ = sendmsg::<UnixAddr>(
         conn.as_raw_fd(),
@@ -491,7 +497,7 @@ fn dispatch(
     conn: &OwnedFd,
     sinks: &Arc<SinkCache>,
     call_counter: &Arc<AtomicU64>,
-) -> i32 {
+) {
     let rules: &Rules = &snap.rules;
     let manifest = &snap.manifest;
     let peer = peer_of(conn);
@@ -580,7 +586,8 @@ fn dispatch(
             l.reject(call, &format!("audit_unwritable: {reason}"), argv);
         }
         eprintln!("sluice: refusing to execute (audit=strict): {reason}");
-        return ERR_AUDIT;
+        send_reply(conn, ERR_AUDIT);
+        return;
     }
 
     // Strict + unhealthy manifest: refuse before doing anything else.
@@ -590,7 +597,8 @@ fn dispatch(
     if let Some(l) = manifest {
         if !l.is_healthy() && rules.defaults.audit == AuditMode::Strict {
             eprintln!("sluice: refusing to execute (audit=strict): manifest unhealthy");
-            return ERR_AUDIT;
+            send_reply(conn, ERR_AUDIT);
+            return;
         }
     }
 
@@ -608,7 +616,8 @@ fn dispatch(
             );
             if !ok && rules.defaults.audit == AuditMode::Strict {
                 eprintln!("sluice: refusing to execute (audit=strict): start write failed");
-                return ERR_AUDIT;
+                send_reply(conn, ERR_AUDIT);
+                return;
             }
         }
     } else if log_argv {
@@ -630,13 +639,15 @@ fn dispatch(
     } else {
         None
     };
-    let SpawnOutcome {
-        status,
+    let SpawnOutcome { status, drain } = run_matched(rule, rules, &req.argv, stdio, ctx);
+    let dur_ms = started.elapsed().as_millis() as u64;
+    send_reply(conn, status);
+    let Drained {
         stdout_bytes,
         stderr_bytes,
         sink_failed,
-    } = run_matched(rule, rules, &req.argv, stdio, ctx);
-    let dur_ms = started.elapsed().as_millis() as u64;
+        cut,
+    } = drain.map(Drain::wait).unwrap_or_default();
 
     // A sink write failed mid-call. Mid-call we can't undo — the child
     // already produced bytes that didn't make it to disk. But we
@@ -655,14 +666,16 @@ fn dispatch(
     if let (Some(l), Some(call)) = (manifest, call_id) {
         l.exit(
             call,
-            status,
-            dur_ms,
-            stdout_bytes,
-            stderr_bytes,
-            sink_failed,
+            &ExitEvent {
+                status,
+                duration_ms: dur_ms,
+                stdout_bytes,
+                stderr_bytes,
+                truncated: sink_failed,
+                drain_timeout: cut,
+            },
         );
     }
-    status
 }
 
 fn recv_request(conn: &OwnedFd) -> Result<(Request, Option<[OwnedFd; 3]>), ()> {

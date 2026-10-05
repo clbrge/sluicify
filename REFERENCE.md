@@ -97,6 +97,10 @@ timeout = 250ms
 When the timeout fires, the wire reply is `ERR_SIGNALED` (-5) and the
 manifest exit event records the elapsed time.
 
+The timeout also bounds output capture under `stdoutfile`/`stderrfile`:
+relays stop at timeout + 2 s even if a background process still holds
+the pipe. A process that left the group with `setsid` is not killed.
+
 ### `cwd = <path>`
 
 Absolute path. Child `chdir`s here just before `execve`. If the path
@@ -160,6 +164,14 @@ When neither `stdoutfile` nor `stderrfile` is set, sluice uses the
 **direct** spawn path — caller's fds are `dup2`'d straight onto the
 child's 0/1/2, no userspace copy. When at least one is set, sluice
 interposes pipes and runs relay threads to tee.
+
+Either way the reply goes out when the direct child exits, as with a
+shell. If a background process the child started still holds stdout or
+stderr, the reply waits at most 200 ms for it. The relays then keep
+capturing its output until it closes the pipe, or, if the rule has a
+`timeout`, until timeout + 2 s. The call keeps its broker slot until the
+capture ends, and the manifest exit event is written then, with
+`"drain_timeout":true` if capture was cut at the deadline.
 
 ### `audit = strict | best-effort`
 
@@ -320,6 +332,11 @@ when at least one sink lost bytes during the call:
 
 Find them with `jq 'select(.truncated)'`. The field is omitted on
 clean calls to keep common-case lines shorter.
+
+`duration_ms` measures the direct child. When output capture was cut at
+the rule's timeout + 2 s while a background process still held the
+pipe, the exit event carries `"drain_timeout":true` (also omitted when
+false).
 
 ---
 

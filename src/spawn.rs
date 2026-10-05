@@ -26,7 +26,9 @@ use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub struct TeeSink {
@@ -37,12 +39,72 @@ pub struct TeeSink {
 #[derive(Default)]
 pub struct SpawnOutcome {
     pub status: i32,
+    /// Tee mode only: relays still draining output from descendants
+    /// that outlive the direct child.
+    pub drain: Option<Drain>,
+}
+
+pub struct Drain {
+    stdout: JoinHandle<Relayed>,
+    stderr: JoinHandle<Relayed>,
+    done: mpsc::Receiver<()>,
+}
+
+#[derive(Default)]
+pub struct Drained {
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     /// At least one sink write failed mid-call. Strict mode propagates
     /// this to the manifest's unhealthy flag, refusing the next call.
     pub sink_failed: bool,
+    /// The drain deadline passed while a descendant still held a pipe.
+    pub cut: bool,
 }
+
+impl Drain {
+    fn settle(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        for _ in 0..2 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.done.recv_timeout(left).is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn wait(self) -> Drained {
+        let out = joined(self.stdout);
+        let err = joined(self.stderr);
+        Drained {
+            stdout_bytes: out.bytes,
+            stderr_bytes: err.bytes,
+            sink_failed: out.sink_failed || err.sink_failed,
+            cut: out.cut || err.cut,
+        }
+    }
+}
+
+fn joined(h: JoinHandle<Relayed>) -> Relayed {
+    h.join().unwrap_or(Relayed {
+        sink_failed: true,
+        ..Default::default()
+    })
+}
+
+#[derive(Default)]
+struct Relayed {
+    bytes: u64,
+    sink_failed: bool,
+    cut: bool,
+}
+
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Upper bound on how long the reply waits for the relays to reach EOF
+/// after the direct child exits. Without background holders EOF is
+/// immediate, so the caller's output and the sink are complete before
+/// the reply.
+const REPLY_SETTLE: Duration = Duration::from_millis(200);
 
 pub struct SpawnCtx {
     pub call: CallId,
@@ -275,6 +337,7 @@ fn run_with_tee(
         }
     };
 
+    let drain_deadline = timeout.map(|t| Instant::now() + t + KILL_GRACE);
     let stdin_raw = stdin_fd.as_raw_fd();
     let pout_w_raw = pout_w.as_raw_fd();
     let perr_w_raw = perr_w.as_raw_fd();
@@ -307,33 +370,56 @@ fn run_with_tee(
             drop(perr_w);
             drop(stdin_fd);
 
-            let h_out = std::thread::spawn(move || relay(pout_r, stdout_fd, ctx.stdout_sink));
-            let h_err = std::thread::spawn(move || relay(perr_r, stderr_fd, ctx.stderr_sink));
+            let (done_tx, done) = mpsc::channel();
+            let stdout_done = done_tx.clone();
+            let stdout = std::thread::spawn(move || {
+                let r = relay(pout_r, stdout_fd, ctx.stdout_sink, drain_deadline);
+                let _ = stdout_done.send(());
+                r
+            });
+            let stderr = std::thread::spawn(move || {
+                let r = relay(perr_r, stderr_fd, ctx.stderr_sink, drain_deadline);
+                let _ = done_tx.send(());
+                r
+            });
 
             let status = wait_child_with_timeout(child, timeout);
-
-            let (out_bytes, out_failed) = h_out.join().unwrap_or((0, false));
-            let (err_bytes, err_failed) = h_err.join().unwrap_or((0, false));
-
+            let drain = Drain {
+                stdout,
+                stderr,
+                done,
+            };
+            drain.settle(REPLY_SETTLE);
             SpawnOutcome {
                 status,
-                stdout_bytes: out_bytes,
-                stderr_bytes: err_bytes,
-                sink_failed: out_failed || err_failed,
+                drain: Some(drain),
             }
         }
     }
 }
 
-/// Returns (bytes written to sink, whether at least one sink write
-/// failed). The boolean lets the caller mark the broker unhealthy so
-/// the next strict-mode call refuses, symmetric with manifest write
-/// failures.
-fn relay(src: OwnedFd, dst: OwnedFd, sink: Option<TeeSink>) -> (u64, bool) {
+/// Runs until every writer has closed the pipe or, past `deadline`,
+/// until nothing is left buffered. `sink_failed` lets the caller mark
+/// the broker unhealthy so the next strict-mode call refuses,
+/// symmetric with manifest write failures.
+fn relay(src: OwnedFd, dst: OwnedFd, sink: Option<TeeSink>, deadline: Option<Instant>) -> Relayed {
     let mut buf = [0u8; 8192];
-    let mut total: u64 = 0;
-    let mut failed = false;
+    let mut out = Relayed::default();
     loop {
+        if let Some(d) = deadline {
+            let left_ms = d
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            match poll_readable(&src, left_ms) {
+                0 => {
+                    out.cut = true;
+                    break;
+                }
+                r if r < 0 => break,
+                _ => {}
+            }
+        }
         let n = match nix::unistd::read(src.as_raw_fd(), &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -352,19 +438,19 @@ fn relay(src: OwnedFd, dst: OwnedFd, sink: Option<TeeSink>) -> (u64, bool) {
                     Ok(()) => n as u64,
                     Err(e) => {
                         eprintln!("sluice: AUDIT SINK WRITE FAILED: {e}");
-                        failed = true;
+                        out.sink_failed = true;
                         0
                     }
                 }
             } else {
-                failed = true;
+                out.sink_failed = true;
                 0
             };
             s.bytes.fetch_add(written, Ordering::Relaxed);
-            total += written;
+            out.bytes += written;
         }
     }
-    (total, failed)
+    out
 }
 
 fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> Result<(), nix::errno::Errno> {
@@ -424,11 +510,11 @@ fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> i32 {
     };
 
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    if poll_pidfd(&pidfd, timeout_ms) == 0 {
+    if poll_readable(&pidfd, timeout_ms) == 0 {
         // Timeout fired. Signal the whole process group, then a brief
         // grace period, then SIGKILL the group.
         let _ = kill_tree(pid, Signal::SIGTERM, Some(&pidfd));
-        if poll_pidfd(&pidfd, 2_000) == 0 {
+        if poll_readable(&pidfd, KILL_GRACE.as_millis() as i32) == 0 {
             let _ = kill_tree(pid, Signal::SIGKILL, Some(&pidfd));
         }
     }
@@ -484,11 +570,11 @@ fn pidfd_send_signal(pidfd: &OwnedFd, sig: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Returns: positive if pidfd is ready (process exited), 0 on timeout,
-/// negative on error.
-fn poll_pidfd(pidfd: &OwnedFd, timeout_ms: i32) -> i32 {
+/// Returns: positive if `fd` is readable (for a pidfd: the process
+/// exited; for a pipe: data or hangup), 0 on timeout, negative on error.
+fn poll_readable(fd: &OwnedFd, timeout_ms: i32) -> i32 {
     let mut pfd = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
+        fd: fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };

@@ -289,3 +289,69 @@ fn child_starts_with_default_signal_state() {
         "child inherited SIGPIPE ignored"
     );
 }
+
+const TEE_RULES: &str = "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
+     \x20\x20logfile = $DIR/manifest.jsonl\n\n\
+     /bin/sh -c #1\n  stdoutfile = $DIR/c#$call.out\n";
+
+fn call_timed(broker: &Broker, argv: &[&str]) -> (i32, Duration) {
+    let caller_out = std::fs::File::create(broker.dir.join("caller.out")).unwrap();
+    let started = Instant::now();
+    let status = Command::new(SLUICIFY_BIN)
+        .arg(&broker.socket)
+        .args(argv)
+        .stdout(caller_out)
+        .status()
+        .expect("run sluicify");
+    (status.code().unwrap_or(-1), started.elapsed())
+}
+
+fn wait_for_exit_event(broker: &Broker, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Some(line) = broker.manifest().and_then(|m| {
+            m.lines()
+                .find(|l| l.contains("\"kind\":\"exit\""))
+                .map(String::from)
+        }) {
+            return line;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no exit event within {within:?}: {:?}", broker.manifest());
+}
+
+#[test]
+fn tee_mode_replies_when_direct_child_exits() {
+    let broker = Broker::start(TEE_RULES);
+    let (code, took) = call_timed(&broker, &["/bin/sh", "-c", "echo hi; sleep 2 &"]);
+    assert_eq!(code, 0);
+    assert!(
+        took < Duration::from_millis(1500),
+        "reply waited for the background sleep: {took:?}"
+    );
+
+    let exit = wait_for_exit_event(&broker, Duration::from_secs(5));
+    assert!(exit.contains("\"stdout_bytes\":3"), "{exit}");
+    assert!(!exit.contains("drain_timeout"), "{exit}");
+    assert_eq!(std::fs::read(broker.dir.join("c1.out")).unwrap(), b"hi\n");
+    assert_eq!(
+        std::fs::read(broker.dir.join("caller.out")).unwrap(),
+        b"hi\n"
+    );
+}
+
+#[test]
+fn tee_drain_is_cut_at_timeout_plus_grace() {
+    let broker = Broker::start(&TEE_RULES.replace(
+        "stdoutfile = $DIR/c#$call.out\n",
+        "stdoutfile = $DIR/c#$call.out\n  timeout = 1s\n",
+    ));
+    let (code, took) = call_timed(&broker, &["/bin/sh", "-c", "echo hi; sleep 6 &"]);
+    assert_eq!(code, 0);
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+
+    let exit = wait_for_exit_event(&broker, Duration::from_secs(5));
+    assert!(exit.contains("\"drain_timeout\":true"), "{exit}");
+    assert!(exit.contains("\"stdout_bytes\":3"), "{exit}");
+}
