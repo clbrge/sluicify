@@ -21,7 +21,9 @@ use sluicify::proto::{
     decode_request, encode_reply, Request, ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PEER, ERR_PROTO,
     ERR_SPAWN, MAX_PAYLOAD,
 };
-use sluicify::rules::{self, AuditMode, LogPolicy, PathCtx, PathTemplate, Rules, TokenPattern};
+use sluicify::rules::{
+    self, AuditMode, LogPolicy, Miss, PathCtx, PathTemplate, Rules, TokenPattern,
+};
 use sluicify::spawn::{resolve_exe, run_matched, Drain, Drained, SpawnCtx, SpawnOutcome, TeeSink};
 
 #[derive(Parser)]
@@ -92,11 +94,22 @@ fn check(path: &Path) -> ExitCode {
         );
     }
     for r in &rules.rules {
-        for slot in r.unconstrained_slots() {
-            println!(
-                "warning: line {}: slot {slot} has no regex — accepts any value, including option flags",
-                r.line_no
-            );
+        for slot in r.slots() {
+            let line = r.line_no;
+            if r.allow_any.contains(slot) {
+                println!("note: line {line}: slot {slot} accepts any value (allow_any)");
+            } else if r.allow_dash.contains(slot) {
+                println!("note: line {line}: slot {slot} accepts option-like values (allow_dash)");
+            } else if r
+                .slot_regex
+                .get(slot)
+                .is_some_and(rules::requires_leading_dash)
+            {
+                println!(
+                    "warning: line {line}: slot {slot} only matches values starting with '-', \
+                     which are refused unless it is listed in allow_dash"
+                );
+            }
         }
     }
     ExitCode::SUCCESS
@@ -110,16 +123,23 @@ fn match_cmd(path: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match rules.match_argv(argv) {
-        Some(m) => {
+    match rules.check_argv(argv) {
+        Ok(m) => {
             println!("match: rule at line {}", m.rule.line_no);
             for (k, v) in &m.bindings {
                 println!("  {k} = {v:?}");
             }
             ExitCode::SUCCESS
         }
-        None => {
+        Err(Miss::NoRule) => {
             eprintln!("no match");
+            ExitCode::from(1)
+        }
+        Err(Miss::OptionLike { line, slot }) => {
+            eprintln!(
+                "no match: rule at line {line} refuses slot {slot}: value starts with '-' \
+                 (list the slot in allow_dash to accept option-like values)"
+            );
             ExitCode::from(1)
         }
     }
@@ -504,21 +524,25 @@ fn handle_conn(
                 }
                 ERR_FDS
             }
-            Some(stdio) => match rules.match_argv(&req.argv) {
-                None => {
+            Some(stdio) => match rules.check_argv(&req.argv) {
+                Err(miss) => {
+                    let reason = match &miss {
+                        Miss::NoRule => "no_rule".to_string(),
+                        Miss::OptionLike { line, slot } => {
+                            format!("option_like: rule at line {line}, slot {slot}")
+                        }
+                    };
                     if let Some(l) = manifest {
                         let argv: &[String] = if reject_log_argv { &req.argv } else { &[] };
-                        l.reject(next_call(), "no_rule", argv);
+                        l.reject(next_call(), &reason, argv);
                     } else if reject_log_argv {
-                        eprintln!("sluice: no rule matched argv={:?}", req.argv);
+                        eprintln!("sluice: rejected ({reason}) argv={:?}", req.argv);
                     } else {
-                        eprintln!("sluice: no rule matched (argv suppressed)");
+                        eprintln!("sluice: rejected ({reason}, argv suppressed)");
                     }
                     ERR_NO_RULE
                 }
-                Some(m) => {
-                    return dispatch(m.rule, &snap, &req, stdio, &conn, &sinks, &call_counter)
-                }
+                Ok(m) => return dispatch(m.rule, &snap, &req, stdio, &conn, &sinks, &call_counter),
             },
         },
         Err(()) => ERR_PROTO,

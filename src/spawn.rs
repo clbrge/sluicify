@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn build_argv_for_bare_name_keeps_token_count() {
-        let r = parse("git log -n #1\n").unwrap();
+        let r = parse("git log -n #1\n  1 = ^[0-9]+$\n").unwrap();
         let caller = vec!["git".into(), "log".into(), "-n".into(), "5".into()];
         let argv = build_argv(&r.rules[0], &caller);
         assert_eq!(argv, vec!["git", "log", "-n", "5"]);

@@ -8,7 +8,10 @@
 ;   - Indented lines below a rule attach either a per-slot regex
 ;     (anchored ^…$) or a control attribute:
 ;         timeout cwd env log
-;         logfile stdoutfile stderrfile
+;         stdoutfile stderrfile
+;         allow_dash allow_any
+;     Every slot needs a regex (or allow_any), and values starting with
+;     '-' are refused unless the slot is in allow_dash.
 ;   - Comments use ';'. On rule lines a ';' inside a '…' or "…"
 ;     literal is data. An attribute value that starts with a quote is
 ;     one quoted word (1 = '^a;b$'); otherwise write a literal ';' as \;.

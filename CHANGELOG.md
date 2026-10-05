@@ -19,10 +19,14 @@ breaking changes (and will be called out under **Changed** with a note).
   tight: any other `$VAR` is a parse error, as is an unset allowlisted
   var (no silent empty splices). The existing `#$slot` syntax is
   unaffected and composes naturally (`$HOME/log/c#$call.out`).
-- `sluice check` warns about slots without a regex.
+- `allow_dash` and `allow_any` rule attributes, listing slots that may
+  take option-like values or any value. `sluice check` lists them.
 
 ### Changed
 
+- **Rules:** every slot needs a regex unless listed in `allow_any`, and
+  slot values starting with `-` are refused unless the slot is listed
+  in `allow_dash` (reject reason `option_like`).
 - **Wire protocol:** a child killed by a signal now reports `128 +
   signo` instead of `ERR_SIGNALED` (-5, no longer sent). A fired rule
   timeout reports the new `ERR_TIMEOUT` (-7); `sluicify` and the

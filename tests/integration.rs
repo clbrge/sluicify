@@ -115,7 +115,7 @@ fn happy_path_echo() {
 fn unknown_command_rejected_with_129() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = HOME,LANG\n\n\
-         echo #1\n",
+         echo #1\n  1 = ^[a-z_]+$\n",
     );
     let (code, _, _) = broker.call(&["cat", "/etc/passwd"]);
     assert_eq!(code, 129, "ERR_NO_RULE → 128 + 1 = 129");
@@ -139,7 +139,7 @@ fn exit_only_suppresses_argv_in_manifest() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = HOME,LANG\n\
          \x20\x20log = exit-only\n  logfile = $DIR/manifest.jsonl\n\n\
-         echo #1\n",
+         echo #1\n  1 = ^[a-z_]+$\n",
     );
     let (code, _, _) = broker.call(&["echo", "secret_token_zzz"]);
     assert_eq!(code, 0);
@@ -161,7 +161,7 @@ fn exit_only_suppresses_argv_in_manifest() {
 fn timeout_kills_grandchild_in_process_group() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = HOME,LANG,PATH\n  exec_path = inherit\n\n\
-         /bin/sh -c #1\n  timeout = 1s\n",
+         /bin/sh -c #1\n  allow_any = 1\n  timeout = 1s\n",
     );
     let marker = broker.dir.join("gc.pid");
     let cmd = format!("sleep 30 & echo $! > {} ; wait", marker.display());
@@ -241,7 +241,7 @@ fn open_fd_count(pid: u32) -> usize {
 
 #[test]
 fn rejected_requests_do_not_leak_passed_fds() {
-    let broker = Broker::start("defaults:\n  audit = best-effort\n\necho #1\n");
+    let broker = Broker::start("defaults:\n  audit = best-effort\n\necho #1\n  1 = ^[a-z_]+$\n");
     let pid = broker.child.id();
     let before = open_fd_count(pid);
 
@@ -267,7 +267,7 @@ fn rejected_requests_do_not_leak_passed_fds() {
 fn child_starts_with_default_signal_state() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\n\
-         /bin/sh -c #1\n",
+         /bin/sh -c #1\n  allow_any = 1\n",
     );
     let (code, stdout, _) = broker.call(&[
         "/bin/sh",
@@ -293,7 +293,7 @@ fn child_starts_with_default_signal_state() {
 
 const TEE_RULES: &str = "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
      \x20\x20logfile = $DIR/manifest.jsonl\n\n\
-     /bin/sh -c #1\n  stdoutfile = $DIR/c#$call.out\n";
+     /bin/sh -c #1\n  allow_any = 1\n  stdoutfile = $DIR/c#$call.out\n";
 
 fn call_timed(broker: &Broker, argv: &[&str]) -> (i32, Duration) {
     let caller_out = std::fs::File::create(broker.dir.join("caller.out")).unwrap();
@@ -362,7 +362,7 @@ fn signal_death_exits_128_plus_signo() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
          \x20\x20logfile = $DIR/manifest.jsonl\n\n\
-         /bin/sh -c #1\n",
+         /bin/sh -c #1\n  allow_any = 1\n",
     );
     let (code, _, _) = broker.call(&["/bin/sh", "-c", "kill -KILL $$"]);
     assert_eq!(code, 137);
@@ -377,7 +377,7 @@ fn timeout_is_recorded_in_manifest() {
     let broker = Broker::start(
         "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
          \x20\x20logfile = $DIR/manifest.jsonl\n\n\
-         /bin/sh -c #1\n  timeout = 300ms\n",
+         /bin/sh -c #1\n  allow_any = 1\n  timeout = 300ms\n",
     );
     let (code, _, _) = broker.call(&["/bin/sh", "-c", "exec sleep 30"]);
     assert_eq!(code, 124);
@@ -427,4 +427,22 @@ fn second_broker_refuses_live_socket() {
     let (code, stdout, _) = broker.call(&["echo", "alive"]);
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "alive");
+}
+
+#[test]
+fn option_like_value_rejected_with_reason() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  logfile = $DIR/manifest.jsonl\n\n\
+         echo #1\n  1 = ^[a-z=-]+$\n",
+    );
+    let (code, _, stderr) = broker.call(&["echo", "--output=x"]);
+    assert_eq!(code, 129, "{stderr}");
+    let manifest = broker.manifest().expect("manifest");
+    assert!(
+        manifest.contains("\"reason\":\"option_like: rule at line 5, slot #1\""),
+        "{manifest}"
+    );
+    let (code, stdout, _) = broker.call(&["echo", "plain"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "plain");
 }

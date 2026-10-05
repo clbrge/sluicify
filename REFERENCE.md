@@ -217,12 +217,49 @@ match the whole value. Your own `^`/`$` are harmless but redundant.
 
 Slot values exceeding 4 KB are rejected unconditionally.
 
-If no regex is given, the only constraint is the 4 KB length cap.
+**Every slot needs a regex**, unless it is listed in `allow_any`. A slot
+with neither is a parse error.
+
+**Values starting with `-` are refused** on every slot, even when the
+regex matches, unless the slot is listed in `allow_dash`. Programs read
+a leading `-` as an option, and options such as `git log
+--output=<file>` or `rsync -e <cmd>` do far more than the positional
+value the rule author had in mind. The usual "safe" class
+`^[A-Za-z0-9._/-]+$` accepts `-o/etc/x`, so the regex alone can't be
+relied on for this. A refusal is logged with reject reason
+`option_like`, and `sluice match` explains it.
+
+### `allow_dash = <slot>[, <slot>…]` and `allow_any = <slot>[, <slot>…]`
+
+Explicit, per-rule widening, one or more slot names (`1`, `count`, or
+`#count`):
+
+| slot declared with      | value is checked against                        |
+|-------------------------|-------------------------------------------------|
+| regex                   | the regex, and must not start with `-`          |
+| regex + `allow_dash`    | the regex only                                  |
+| `allow_any` (no regex)  | nothing but the 4 KB cap                        |
+
+```
+sort #opt #file
+  opt  = ^-[rn]$
+  file = ^[a-z]+\.txt$
+  allow_dash = opt
+
+git commit -m #msg          ; the value of -m is never parsed as an option
+  allow_any = msg
+```
+
+Contradictions are parse errors: a regex on an `allow_any` slot, a slot
+in both lists, `allow_dash` on a slot without a regex, or a slot the
+rule doesn't have. `sluice check` lists every `allow_any` and
+`allow_dash` slot so a reviewer sees all widening in one place.
 
 ### Reserved attribute names
 
 The keys `timeout`, `cwd`, `env`, `log`, `logfile`, `stdoutfile`,
-`stderrfile`, `exec_path` cannot be used as named slots. Use a
+`stderrfile`, `exec_path`, `allow_dash`, `allow_any` cannot be used as
+named slots. Use a
 different slot name.
 
 ---
@@ -488,10 +525,11 @@ so shell pipelines can branch on them.
 
 ### `sluice check <rules-file>`
 
-Parse the file, report rule count and exe shape per rule, and print a
-warning for every slot without a regex (it accepts any value, option
-flags included). Returns 0 on success, 1 on parse error; warnings don't
-change the exit code.
+Parse the file and report rule count and exe shape per rule. Then list
+every slot widened with `allow_any` or `allow_dash`, and warn about a
+regex that only matches values starting with `-` on a slot not in
+`allow_dash` (it can never match). Returns 0 on success, 1 on parse
+error; notes and warnings don't change the exit code.
 
 ```sh
 $ sluice check ~/.config/sluice/agent.rules
@@ -626,8 +664,8 @@ For shared-host deployment, before going live, verify:
 - [ ] `exec_path` is **explicit** (not `inherit`). The default is good
       for most cases.
 - [ ] `audit = strict` (the default — don't change without a reason).
-- [ ] Every slot has a regex constraint, no matter how trivially
-      "obvious". Slots without regex accept any 4 KB blob.
+- [ ] Every `allow_any` and `allow_dash` entry in the `sluice check`
+      output is intended.
 - [ ] Rules are tested with `sluice check` and a representative set of
       `sluice match` invocations.
 - [ ] `logrotate` configured for the manifest. Sluice reopens on

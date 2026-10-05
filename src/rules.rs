@@ -5,7 +5,7 @@
 //! lines attach attributes to the stanza above.
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -185,6 +185,8 @@ pub struct Rule {
     pub exe: ExeMatch,
     pub tokens: Vec<TokenPattern>,
     pub slot_regex: HashMap<SlotId, Regex>,
+    pub allow_dash: HashSet<SlotId>,
+    pub allow_any: HashSet<SlotId>,
     pub timeout: Option<Duration>,
     pub cwd: Option<PathBuf>,
     pub env: Option<EnvPolicy>,
@@ -204,6 +206,17 @@ pub struct Rules {
 pub struct Match<'r> {
     pub rule: &'r Rule,
     pub bindings: HashMap<SlotId, String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Miss {
+    NoRule,
+    /// A rule would have matched but for a slot value starting with
+    /// `-` on a slot not listed in `allow_dash`.
+    OptionLike {
+        line: usize,
+        slot: SlotId,
+    },
 }
 
 #[derive(Debug)]
@@ -254,6 +267,9 @@ pub fn parse(input: &str) -> Result<Rules, ParseError> {
         }
     }
 
+    for r in &rules {
+        validate_slots(r)?;
+    }
     Ok(Rules { defaults, rules })
 }
 
@@ -581,14 +597,20 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
             r.exec_path = Some(parse_exec_path(val, line_no)?);
             return Ok(());
         }
+        "allow_dash" => {
+            let slots = parse_slot_list(r, key, val, line_no)?;
+            r.allow_dash.extend(slots);
+            return Ok(());
+        }
+        "allow_any" => {
+            let slots = parse_slot_list(r, key, val, line_no)?;
+            r.allow_any.extend(slots);
+            return Ok(());
+        }
         _ => {}
     }
     if let Some(slot) = parse_slot_id_bare(key) {
-        if !r
-            .tokens
-            .iter()
-            .any(|t| matches!(t, TokenPattern::Slot(s) if s == &slot))
-        {
+        if !r.has_slot(&slot) {
             return Err(ParseError {
                 line_no,
                 message: format!("regex for {slot} but rule has no such slot"),
@@ -606,6 +628,96 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
         line_no,
         message: format!("unknown rule attribute: {key}"),
     })
+}
+
+fn parse_slot_list(
+    r: &Rule,
+    key: &str,
+    val: &str,
+    line_no: usize,
+) -> Result<Vec<SlotId>, ParseError> {
+    let mut out = Vec::new();
+    for name in val.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let slot = parse_slot_id_bare(name.strip_prefix('#').unwrap_or(name)).ok_or_else(|| {
+            ParseError {
+                line_no,
+                message: format!("{key}: invalid slot name {name:?}"),
+            }
+        })?;
+        if !r.has_slot(&slot) {
+            return Err(ParseError {
+                line_no,
+                message: format!("{key} lists {slot} but rule has no such slot"),
+            });
+        }
+        out.push(slot);
+    }
+    if out.is_empty() {
+        return Err(ParseError {
+            line_no,
+            message: format!("{key} lists no slots"),
+        });
+    }
+    Ok(out)
+}
+
+/// Run once all of a rule's attributes are known: they may come in any
+/// order, so contradictions can't be caught line by line.
+fn validate_slots(r: &Rule) -> Result<(), ParseError> {
+    let err = |message: String| {
+        Err(ParseError {
+            line_no: r.line_no,
+            message,
+        })
+    };
+    for slot in r.slots() {
+        let has_regex = r.slot_regex.contains_key(slot);
+        let any = r.allow_any.contains(slot);
+        let dash = r.allow_dash.contains(slot);
+        if any && has_regex {
+            return err(format!(
+                "slot {slot} has both a regex and allow_any; drop one"
+            ));
+        }
+        if any && dash {
+            return err(format!(
+                "slot {slot} is in both allow_any and allow_dash; allow_any already accepts '-'"
+            ));
+        }
+        if dash && !has_regex {
+            return err(format!(
+                "allow_dash on slot {slot} needs a regex for it (or use allow_any)"
+            ));
+        }
+        if !any && !has_regex {
+            return err(format!(
+                "slot {slot} has no regex; add `{} = <regex>`, or list it in allow_any to accept any value",
+                slot_key(slot)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn slot_key(slot: &SlotId) -> String {
+    match slot {
+        SlotId::Num(n) => n.to_string(),
+        SlotId::Name(s) => s.clone(),
+    }
+}
+
+/// True when the slot regex, as written, starts with a literal `-` and
+/// has no alternation, so every value it accepts is option-like.
+pub fn requires_leading_dash(re: &Regex) -> bool {
+    let full = re.as_str();
+    let Some(raw) = full.strip_prefix("^(?:").and_then(|r| r.strip_suffix(")$")) else {
+        return false;
+    };
+    if raw.contains('|') {
+        return false;
+    }
+    let head = raw.trim_start_matches(['^', '(']).trim_start_matches("?:");
+    head.starts_with('-') || head.starts_with("\\-")
 }
 
 fn anchor_regex(re: &str) -> String {
@@ -749,6 +861,8 @@ fn parse_rule_line(line: &str, line_no: usize) -> Result<Rule, ParseError> {
         exe,
         tokens,
         slot_regex: HashMap::new(),
+        allow_dash: HashSet::new(),
+        allow_any: HashSet::new(),
         timeout: None,
         cwd: None,
         env: None,
@@ -843,22 +957,60 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<String>, ParseError> {
 impl Rules {
     /// First matching rule wins. Returns `None` if no rule matches.
     pub fn match_argv<'r>(&'r self, argv: &[String]) -> Option<Match<'r>> {
+        self.check_argv(argv).ok()
+    }
+
+    /// Like [`Rules::match_argv`], but says why nothing matched.
+    pub fn check_argv<'r>(&'r self, argv: &[String]) -> Result<Match<'r>, Miss> {
         if argv.is_empty() {
-            return None;
+            return Err(Miss::NoRule);
         }
-        self.rules.iter().find_map(|r| r.try_match(argv))
+        let mut miss = Miss::NoRule;
+        for r in &self.rules {
+            match r.try_match(argv) {
+                Tried::Matched(m) => return Ok(m),
+                Tried::OptionLike(slot) if miss == Miss::NoRule => {
+                    miss = Miss::OptionLike {
+                        line: r.line_no,
+                        slot,
+                    };
+                }
+                _ => {}
+            }
+        }
+        Err(miss)
     }
 }
 
+enum Tried<'r> {
+    Matched(Match<'r>),
+    OptionLike(SlotId),
+    Missed,
+}
+
 impl Rule {
-    pub fn unconstrained_slots(&self) -> impl Iterator<Item = &SlotId> {
+    pub fn slots(&self) -> impl Iterator<Item = &SlotId> {
         self.tokens.iter().filter_map(|t| match t {
-            TokenPattern::Slot(id) if !self.slot_regex.contains_key(id) => Some(id),
-            _ => None,
+            TokenPattern::Slot(id) => Some(id),
+            TokenPattern::Literal(_) => None,
         })
     }
 
-    fn try_match(&self, argv: &[String]) -> Option<Match<'_>> {
+    fn has_slot(&self, slot: &SlotId) -> bool {
+        self.slots().any(|s| s == slot)
+    }
+
+    fn try_match(&self, argv: &[String]) -> Tried<'_> {
+        match self.try_match_inner(argv) {
+            None => Tried::Missed,
+            Some((m, None)) => Tried::Matched(m),
+            Some((_, Some(slot))) => Tried::OptionLike(slot),
+        }
+    }
+
+    /// The second element names the first slot whose value was refused
+    /// only for starting with `-`; everything else about the rule matched.
+    fn try_match_inner(&self, argv: &[String]) -> Option<(Match<'_>, Option<SlotId>)> {
         // Executable
         match &self.exe {
             ExeMatch::BareName(name) => {
@@ -880,6 +1032,7 @@ impl Rule {
         }
         // Tokens
         let mut bindings: HashMap<SlotId, String> = HashMap::new();
+        let mut dash_refused: Option<SlotId> = None;
         for (i, tok) in self.tokens.iter().enumerate() {
             let v = &argv[i + 1];
             match tok {
@@ -892,19 +1045,25 @@ impl Rule {
                     if v.len() > MAX_SLOT_VALUE_BYTES {
                         return None;
                     }
-                    if let Some(re) = self.slot_regex.get(id) {
-                        if !re.is_match(v) {
+                    if !self.allow_any.contains(id) {
+                        if !self.slot_regex.get(id)?.is_match(v) {
                             return None;
+                        }
+                        if v.starts_with('-') && !self.allow_dash.contains(id) {
+                            dash_refused.get_or_insert_with(|| id.clone());
                         }
                     }
                     bindings.insert(id.clone(), v.clone());
                 }
             }
         }
-        Some(Match {
-            rule: self,
-            bindings,
-        })
+        Some((
+            Match {
+                rule: self,
+                bindings,
+            },
+            dash_refused,
+        ))
     }
 }
 
@@ -926,7 +1085,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_rule() {
-        let r = parse("git log --oneline -n #1\n").unwrap();
+        let r = parse("git log --oneline -n #1\n  1 = ^[0-9]+$\n").unwrap();
         assert_eq!(r.rules.len(), 1);
         assert_eq!(r.rules[0].exe, ExeMatch::BareName("git".into()));
         assert_eq!(r.rules[0].tokens.len(), 4);
@@ -989,14 +1148,94 @@ mod tests {
         assert!(!m("abc$;rm"));
     }
 
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn unconstrained_slots_lists_slots_without_regex() {
-        let r = parse("rsync -a #src #dst #3\n  src = ^[a-z]+$\n").unwrap();
-        let free: Vec<String> = r.rules[0]
-            .unconstrained_slots()
-            .map(|s| s.to_string())
+    fn slot_without_regex_rejected() {
+        let err = parse("rsync -a #src #dst\n  src = ^[a-z]+$\n").unwrap_err();
+        assert!(
+            err.message.contains("slot #dst has no regex"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.line_no, 1);
+    }
+
+    #[test]
+    fn dash_value_refused_by_default() {
+        let r = parse("git log #ref\n  ref = ^[A-Za-z0-9._/-]+$\n").unwrap();
+        assert!(r.match_argv(&argv(&["git", "log", "main"])).is_some());
+        assert_eq!(
+            r.check_argv(&argv(&["git", "log", "-o/tmp/x"]))
+                .unwrap_err(),
+            Miss::OptionLike {
+                line: 1,
+                slot: SlotId::Name("ref".into())
+            }
+        );
+    }
+
+    #[test]
+    fn allow_dash_accepts_option_matching_regex() {
+        let r = parse("sort #opt #file\n  opt = ^-[rn]$\n  file = ^[a-z]+$\n  allow_dash = opt\n")
+            .unwrap();
+        assert!(r.match_argv(&argv(&["sort", "-r", "data"])).is_some());
+        assert!(r.match_argv(&argv(&["sort", "-o", "data"])).is_none());
+        assert!(r.match_argv(&argv(&["sort", "-r", "-data"])).is_none());
+    }
+
+    #[test]
+    fn allow_any_accepts_anything() {
+        let r = parse("git commit -m #msg\n  allow_any = #msg\n").unwrap();
+        assert!(r
+            .match_argv(&argv(&["git", "commit", "-m", "-- fix; it's \"done\""]))
+            .is_some());
+    }
+
+    #[test]
+    fn later_rule_still_matches_after_option_like_miss() {
+        let r = parse("ls #1\n  1 = ^.+$\n\nls #1\n  1 = ^-l$\n  allow_dash = 1\n").unwrap();
+        assert_eq!(r.match_argv(&argv(&["ls", "-l"])).unwrap().rule.line_no, 4);
+        assert!(matches!(
+            r.check_argv(&argv(&["ls", "-a"])),
+            Err(Miss::OptionLike { line: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn contradictory_slot_attributes_rejected() {
+        let cases = [
+            (
+                "echo #1\n  1 = ^a$\n  allow_any = 1\n",
+                "both a regex and allow_any",
+            ),
+            (
+                "echo #1\n  allow_any = 1\n  allow_dash = 1\n",
+                "allow_any already accepts",
+            ),
+            ("echo #1 #2\n  2 = ^a$\n  allow_dash = 1\n", "needs a regex"),
+            ("echo #1\n  1 = ^a$\n  allow_dash = 2\n", "no such slot"),
+            ("echo #1\n  1 = ^a$\n  allow_dash =\n", "lists no slots"),
+        ];
+        for (src, want) in cases {
+            let err = parse(src).unwrap_err();
+            assert!(err.message.contains(want), "{src:?}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn requires_leading_dash_detects_dash_only_regexes() {
+        let r = parse(
+            "x #a #b #c #d #e\n  a = ^-[rn]$\n  b = (?:-x)\n  c = \\-y\n  d = -a|b\n  e = [-a]\n",
+        )
+        .unwrap();
+        let got: Vec<bool> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|n| requires_leading_dash(&r.rules[0].slot_regex[&SlotId::Name(n.to_string())]))
             .collect();
-        assert_eq!(free, vec!["#dst", "#3"]);
+        assert_eq!(got, vec![true, true, true, false, false]);
     }
 
     #[test]
@@ -1045,7 +1284,7 @@ mod tests {
 
     #[test]
     fn match_arity_mismatch() {
-        let r = parse("git log -n #1\n").unwrap();
+        let r = parse("git log -n #1\n  1 = ^[0-9]+$\n").unwrap();
         let no = r.match_argv(&["git".into(), "log".into(), "-n".into()]);
         assert!(no.is_none());
     }
@@ -1060,7 +1299,7 @@ mod tests {
 
     #[test]
     fn defaults_then_rule() {
-        let src = "defaults:\n  timeout = 5s\n\ngit log -n #1\n";
+        let src = "defaults:\n  timeout = 5s\n\ngit log -n #1\n  1 = ^[0-9]+$\n";
         let r = parse(src).unwrap();
         assert_eq!(r.defaults.timeout, Some(Duration::from_secs(5)));
         assert_eq!(r.rules.len(), 1);
@@ -1115,7 +1354,7 @@ mod tests {
 
     #[test]
     fn parse_stdoutfile() {
-        let src = "git log -n #1\n  stdoutfile = /var/log/sluice/c#$call.out\n";
+        let src = "git log -n #1\n  1 = ^[0-9]+$\n  stdoutfile = /var/log/sluice/c#$call.out\n";
         let r = parse(src).unwrap();
         assert!(r.rules[0].stdoutfile.is_some());
         assert!(r.rules[0].stdoutfile.as_ref().unwrap().is_per_call());
