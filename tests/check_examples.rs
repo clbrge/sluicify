@@ -13,6 +13,7 @@ fn example_rules_match_git() {
     let rules = sluicify::rules::parse(&src).unwrap();
     let argv: Vec<String> = [
         "git",
+        "--no-pager",
         "-C",
         "/var/repos/main",
         "log",
@@ -32,6 +33,7 @@ fn example_rules_reject_bad_n() {
     let rules = sluicify::rules::parse(&src).unwrap();
     let argv: Vec<String> = [
         "git",
+        "--no-pager",
         "-C",
         "/var/repos/main",
         "log",

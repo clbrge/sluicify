@@ -56,10 +56,30 @@ Three things make it useful:
   is a sanity check, not the auth mechanism.
 - **Not a network service.** AF_UNIX only. You bind-mount the socket
   into the sandbox.
-- **Not a way to grant a shell.** A rule whitelists *one specific*
-  argv shape with regex constraints. If you want a shell, write a rule
-  that runs `/bin/sh -c '<exact-fixed-script>'` — but at that point you
-  could just put the script on PATH and whitelist it.
+- **Not a way to grant a shell** — on purpose. A rule whitelists *one
+  specific* argv shape with regex constraints. But many innocent-looking
+  rules are a shell anyway: `python3` reads a program from stdin,
+  `make` runs whatever the Makefile says, `git` runs hooks and config
+  from the repository. See [Auditing rules](#auditing-rules) below.
+
+## Auditing rules
+
+**sluice checks the shape of an argv; it does not understand the
+program it runs.** A rule grants everything that program can be made
+to do with any value your regexes accept, any bytes on stdin, and any
+file the caller can write — as the broker's uid, outside the sandbox.
+That is almost always more than the one command you had in mind, and
+the gap rarely shows when you read the rule.
+
+Treat every rule as a security decision and audit it against the
+program's whole manual, not against the command you meant. The common
+ways a rule grants more than intended — rules with no slots that still
+run caller code, values a program reads as directives (`@file`,
+`+cmd`), arguments a remote shell parses again, paths that escape,
+regexes looser than they read, caller-chosen destinations, and rules
+that combine — are worked through with examples in
+[REFERENCE.md → Auditing rules](REFERENCE.md#auditing-rules), with a
+per-rule procedure to follow before a rule goes live.
 
 ## How it differs from related tools
 
@@ -89,19 +109,26 @@ agent runs in a tight sandbox — usually:
 - no network, no `sudo`, no host PATH,
 - seccomp filters on dangerous syscalls.
 
-The agent needs **occasional, narrow** access to outside operations:
+The agent does its work — editing, building, testing, committing —
+inside the sandbox. It needs **occasional, narrow** access to the
+operations the sandbox deliberately lacks:
 
-- `git -C /work add/commit/push` against a specific repo,
-- `make test` for the project's test target,
-- `npm install` (or `cargo fetch`) to populate dependencies,
-- `gh pr create` to open a PR,
-- a curated set of read-only host introspection (`uname`, `which`).
+- handing its commits back for review, into a checkout it can't write,
+- network-backed reads: PR or CI status, a package index,
+- the dev services its code talks to: their status and logs,
+- telling you something is ready.
 
-You don't want to give the agent a shell on the host. You don't want
-to bake all those binaries into the sandbox image (network access for
-`npm install` defeats the network-isolation in the first place). And
-you absolutely want an audit trail of every command the agent ran,
-with full stdio.
+You don't want to give the agent a shell on the host, and you don't
+want to open the sandbox's network for a handful of calls. And you
+absolutely want an audit trail of every command the agent ran, with
+full stdio.
+
+What doesn't belong on that menu is anything that runs code the agent
+wrote: `make test`, `npm install` or any `git` command in the agent's
+own workspace execute its Makefile, its install scripts, its hooks
+and its `.git/config` — on the host, outside the sandbox. Those run
+inside the sandbox, or not through sluice. See
+[Auditing rules](#auditing-rules).
 
 sluice is exactly that menu. The agent gets one bind-mounted unix
 socket, calls a 30-line client to invoke whitelisted operations, and
@@ -110,9 +137,10 @@ manifest line you can `jq`.
 
 ### Other use cases (less load-bearing)
 
-- **CI runner for untrusted PRs.** The PR's code runs in a sandbox; a
-  curated set of `git`/`make`/`docker build` operations route through
-  sluice with audit.
+- **CI runner for untrusted PRs.** The PR's build and tests run in the
+  sandbox; sluice exposes only the outside operations the job needs,
+  with their targets fixed in the rules — posting a status, uploading
+  an artifact to one location.
 - **Reproducible build sandboxes.** Nix-style fully-sealed builds need
   *just enough* outside access (e.g. fetching tarballs from a known
   mirror via the project's tooling). sluice exposes that one operation
@@ -122,7 +150,7 @@ manifest line you can `jq`.
 
 ---
 
-## Tutorial: a coding agent that can commit and run tests
+## Tutorial: a coding agent that hands its work back for review
 
 This walks you through configuring sluice end to end, **entirely in
 user-land** — no `sudo`, no dedicated system user, no `/var` paths.
@@ -158,8 +186,18 @@ After `chmod 0700`, these dirs satisfy that without further ceremony.
 
 ### 2. Write a rules file
 
-The agent works in `$HOME/work` (substitute your project root). It
-has no PATH and no shell inside the sandbox — only the broker socket.
+The agent works in `$HOME/work`, bind-mounted into its sandbox, and
+runs `git`, the build and the tests there, inside the sandbox. Its
+commits come back to you as a patch series applied to a separate
+review clone, `$HOME/review/project`, which the agent cannot write:
+
+```sh
+git clone https://example.com/example-org/project.git "$HOME/review/project"
+```
+
+Every rule below is closed: fixed arguments, or slots pinned by a
+strict regex, and no rule reads a file the agent can write. Free text —
+the patches — travels on stdin as data, never in argv.
 
 ```sh
 cat > "$HOME/.config/sluice/agent.rules" <<EOF
@@ -174,27 +212,26 @@ defaults:
   stdoutfile = $HOME/.local/state/sluice/calls/c#\$call.out
   stderrfile = $HOME/.local/state/sluice/calls/c#\$call.err
 
-; Git operations confined to the agent's workspace.
-git -C $HOME/work add #path
-  path = ^[a-zA-Z0-9._/-]+\$
+; Hand commits back: a patch series (git format-patch output) on stdin,
+; applied to the review clone. Its hooks and config are yours.
+git -C $HOME/review/project am --quiet
 
-git -C $HOME/work commit -m #msg
-  msg = ^[\x20-\x7e]{1,200}\$          ; printable ASCII, ≤200 chars
+; PR status. gh's auth comes from \$HOME (which we inherit).
+gh pr view #number -R example-org/project --json number,title,state,url
+  number = ^[1-9][0-9]{0,5}\$
 
-git -C $HOME/work status
+; The dev service the agent's code talks to. --no-pager: with a
+; terminal on stdout, a pager would accept shell escapes.
+systemctl --user --no-pager status #unit
+  unit = ^[a-z0-9-]{1,40}\.service\$
 
-git -C $HOME/work log --oneline -n #n
-  n = ^[1-9][0-9]?\$                   ; 1–99
+journalctl --user --no-pager -n 200 -u #unit
+  unit = ^[a-z0-9-]{1,40}\.service\$
 
-; Run the project's test target. No arguments — the Makefile decides.
-make -C $HOME/work test
-  timeout = 600s
-
-; Open a PR. gh's auth comes from \$HOME (which we inherit).
-gh pr create --title #title --body #body --head #branch
-  title  = ^[\x20-\x7e]{1,80}\$
-  body   = ^[\x20-\x7e]{0,4000}\$
-  branch = ^[a-z][a-z0-9-]{0,40}\$
+; Tell you something is ready.
+notify-send -t 5000 #msg
+  msg = ^[A-Za-z0-9 ,.:!?()'/-]{1,80}\$
+  env = DBUS_SESSION_BUS_ADDRESS
 EOF
 ```
 
@@ -209,17 +246,33 @@ rules into a dotfiles repo shared between users), sluice expands
 No other `$VAR` is allowed; typos and unset vars fail loudly at parse
 time rather than landing audit data in a literal `$HOMW` directory.
 
+> **Left out on purpose.** There is no `make test`, no `npm install`
+> and no `git -C $HOME/work …` here. `$HOME/work` is the agent's, so it
+> writes the `Makefile`, the install scripts, `.git/hooks/` and
+> `.git/config` — and any of those rules would run whatever the agent
+> put there, on your host, as you. No regex changes that. They are the
+> first counter-examples in
+> [Auditing rules](REFERENCE.md#auditing-rules).
+
 Test it without running the broker:
 
 ```sh
 $ sluice check ~/.config/sluice/agent.rules
 ok: 5 rule(s)
-  line  10: BareName("git")  tokens=4  slots=1
-  line  13: BareName("git")  tokens=4  slots=1
-  line  16: BareName("git")  tokens=2  slots=0
-  line  18: BareName("git")  tokens=4  slots=1
-  line  22: BareName("make") tokens=2  slots=0
-  line  26: BareName("gh")   tokens=8  slots=3
+  line  14: BareName("git")  tokens=4  slots=0
+  line  17: BareName("gh")  tokens=7  slots=1
+  line  22: BareName("systemctl")  tokens=4  slots=1
+  line  25: BareName("journalctl")  tokens=6  slots=1
+  line  29: BareName("notify-send")  tokens=3  slots=1
+```
+
+Then try the worst values you can think of — each should be refused:
+
+```sh
+$ sluice match ~/.config/sluice/agent.rules systemctl --user --no-pager status 'api.service;id'
+no match
+$ sluice match ~/.config/sluice/agent.rules notify-send -t 5000 -u
+no match: rule at line 29 refuses slot #msg: value starts with '-' (list the slot in allow_dash to accept option-like values)
 ```
 
 ### 3. Start the broker
@@ -284,17 +337,22 @@ shipped — bind-mount or copy whichever you prefer into the sandbox:
 
 ```sh
 # Python (stdlib only — no extra dependency)
-python3 /usr/local/share/sluice/sluicify.py /run/agent.sock git -C /work status
+python3 /usr/local/share/sluice/sluicify.py /run/agent.sock \
+    systemctl --user --no-pager status api.service
 
-# The Rust client (~380 KB static binary)
-sluicify /run/agent.sock git -C /work commit -m "fix: handle empty input"
+# The Rust client (~380 KB static binary): the branch's commits,
+# formatted inside the sandbox, applied to the review clone outside
+git -C /work format-patch --stdout origin/main.. \
+  | sluicify /run/agent.sock git -C /home/you/review/project am --quiet
 
 # Node (native addon or spawn fallback)
-node /usr/local/share/sluice/sluicify.js /run/agent.sock make -C /work test
+node /usr/local/share/sluice/sluicify.js /run/agent.sock \
+    notify-send -t 5000 "Patches for review in ~/review/project"
 ```
 
-stdio is byte-for-byte: `git status`'s output appears on the agent's
-stdout exactly as if it had run locally, exit code propagates.
+stdio is byte-for-byte: `systemctl`'s output appears on the agent's
+stdout exactly as if it had run locally, the patch series reaches
+`git am` on stdin untouched, and the exit code propagates.
 
 A request that doesn't match any rule (or trips a regex, or puts a
 `-`-prefixed value in a slot not listed in `allow_dash`) returns exit
@@ -319,9 +377,9 @@ rejected calls as `reject`:
 $ jq -c '{call,kind,argv,resolved,reason,status,duration_ms}
          | with_entries(select(.value != null))' \
     < ~/.local/state/sluice/manifest.jsonl
-{"call":1,"kind":"start","argv":["git","-C","/home/you/work","status"],"resolved":"/usr/bin/git"}
-{"call":1,"kind":"exit","status":0,"duration_ms":42}
-{"call":2,"kind":"start","argv":["git","-C","/home/you/work","commit","-m","fix: handle empty input"],"resolved":"/usr/bin/git"}
+{"call":1,"kind":"start","argv":["systemctl","--user","--no-pager","status","api.service"],"resolved":"/usr/bin/systemctl"}
+{"call":1,"kind":"exit","status":0,"duration_ms":31}
+{"call":2,"kind":"start","argv":["git","-C","/home/you/review/project","am","--quiet"],"resolved":"/usr/bin/git"}
 {"call":2,"kind":"exit","status":0,"duration_ms":118}
 {"call":3,"kind":"reject","argv":["cat","/etc/passwd"],"reason":"no_rule"}
 ```
@@ -333,10 +391,14 @@ And every accepted call's actual stdout/stderr are byte-identical
 sidecars:
 
 ```sh
-$ cat ~/.local/state/sluice/calls/c2.out
-[main 7c3a1f2] fix: handle empty input
- 1 file changed, 3 insertions(+), 1 deletion(-)
+$ cat ~/.local/state/sluice/calls/c1.out
+● api.service - Example API (dev)
+     Loaded: loaded (/home/you/.config/systemd/user/api.service; enabled)
+     Active: active (running) since Mon 2026-10-05 09:12:44 UTC; 2h ago
 ```
+
+stdin is not captured: the patch series call 2 applied is recorded by
+the commits in the review clone, not by the sidecars.
 
 `logrotate` (or your own rotation script) works on the manifest.
 `SIGHUP` reloads the rules file in place:
@@ -367,6 +429,8 @@ wire protocol, and production checklist.
 
 ## Where to look next
 
+- **`REFERENCE.md` → [Auditing rules](REFERENCE.md#auditing-rules)** —
+  read before writing rules for anything that matters.
 - **`REFERENCE.md`** — exhaustive: every attribute, every slot, every
   CLI subcommand, the wire protocol, error codes, production checklist.
 - **`examples/sluice.rules`** — annotated example covering the full

@@ -1,5 +1,9 @@
 ; Example sluice rule file.
 ;
+; Every rule grants whatever its program can be made to do with the
+; values its regexes accept, its stdin, and the files the caller can
+; write. Audit each one before use: REFERENCE.md -> Auditing rules.
+;
 ; Format:
 ;   - One file per sandbox = one socket per sandbox. Identity is the
 ;     socket; the file is the whitelist.
@@ -55,14 +59,18 @@ defaults:
 
 ; --- local, current uid -----------------------------------------------------
 
-git -C /var/repos/main log --oneline -n #1
+; --no-pager: with a terminal on stdout, git's pager accepts shell
+; escapes. /var/repos/main is a repository the caller cannot write.
+git --no-pager -C /var/repos/main log --oneline -n #1
   1 = ^[1-9][0-9]?$
 
 ; --- elevated via sudo (sudoers decides whether sudo lets it through) -------
 
+; Paths pinned under fixed prefixes with no '.' in the class, so '..',
+; absolute paths elsewhere and 'host:' remotes can't match.
 sudo -u ops rsync -a #src #dst
-  src = ^[a-zA-Z0-9._/-]+$
-  dst = ^[a-zA-Z0-9._/-]+$
+  src = ^/srv/data/[a-z0-9_-]+(/[a-z0-9_-]+)*/?$
+  dst = ^/srv/mirror/[a-z0-9_-]+(/[a-z0-9_-]+)*/?$
   timeout = 300s
   ; Per-rule override: dump bulky rsync output into a dedicated tree.
   stdoutfile = /var/log/sluice/rsync/#$ts_ms.out
@@ -75,7 +83,7 @@ ssh -o BatchMode=yes hostY systemctl status #unit
 
 ; --- absolute path, no slots ------------------------------------------------
 
-/usr/bin/systemctl status nginx
+/usr/bin/systemctl --no-pager status nginx
 
 ; --- quoted literal containing ';' (comment-stripping is quote-aware) -------
 

