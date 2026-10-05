@@ -1429,8 +1429,16 @@ mod tests {
         assert!(err.message.contains("unknown system slot"));
     }
 
+    /// The process environment is shared by every test thread; the tests
+    /// that set or remove a variable take this so they can't interleave.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn expands_home_in_stdoutfile() {
+        let _env = env_lock();
         std::env::set_var("HOME", "/home/test");
         let src = "git log\n  stdoutfile = $HOME/tmp/c#$call.out\n";
         let r = parse(src).unwrap();
@@ -1442,6 +1450,7 @@ mod tests {
 
     #[test]
     fn expands_braced_home_in_logfile() {
+        let _env = env_lock();
         std::env::set_var("HOME", "/home/test");
         let src = "defaults:\n  logfile = ${HOME}/.local/state/sluice/manifest.jsonl\n\ngit log\n";
         let r = parse(src).unwrap();
@@ -1453,6 +1462,7 @@ mod tests {
 
     #[test]
     fn expands_xdg_runtime_dir() {
+        let _env = env_lock();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let src = "git log\n  stdoutfile = $XDG_RUNTIME_DIR/sluice/c#$call.out\n";
         let r = parse(src).unwrap();
@@ -1464,6 +1474,7 @@ mod tests {
 
     #[test]
     fn expands_home_in_cwd() {
+        let _env = env_lock();
         std::env::set_var("HOME", "/home/test");
         let src = "git log\n  cwd = $HOME/projects/repo\n";
         let r = parse(src).unwrap();
@@ -1483,6 +1494,7 @@ mod tests {
 
     #[test]
     fn rejects_unset_home() {
+        let _env = env_lock();
         std::env::remove_var("HOME");
         let src = "git log\n  stdoutfile = $HOME/sluice.out\n";
         let err = parse(src).unwrap_err();
@@ -1493,6 +1505,7 @@ mod tests {
 
     #[test]
     fn rejects_unterminated_brace() {
+        let _env = env_lock();
         std::env::set_var("HOME", "/home/test");
         let src = "git log\n  stdoutfile = ${HOME/x.out\n";
         let err = parse(src).unwrap_err();
