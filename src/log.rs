@@ -6,12 +6,15 @@
 //!
 //! ```jsonl
 //! {"call":1,"ts":...,"kind":"start","pid":6210,"line":4,"argv":["echo","hi"],
+//!  "resolved":"/usr/bin/echo",
 //!  "stdout":"~/.local/state/sluice/c1.out","stderr":"~/.local/state/sluice/c1.err"}
 //! {"call":1,"ts":...,"kind":"exit","status":0,"duration_ms":2,
 //!  "stdout_bytes":6,"stderr_bytes":0}
 //! {"call":2,"ts":...,"kind":"reject","reason":"no_rule","argv":["cat","/etc/passwd"]}
 //! {"call":3,"ts":...,"kind":"exit","status":0,"duration_ms":42,
 //!  "stdout_bytes":1024,"stderr_bytes":0,"truncated":true}
+//! {"call":4,"ts":...,"kind":"exit","status":-7,"signal":15,"timed_out":true,
+//!  "duration_ms":30000,"stdout_bytes":0,"stderr_bytes":0}
 //! ```
 //!
 //! `ts` is unix-epoch milliseconds.

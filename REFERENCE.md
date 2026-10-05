@@ -501,7 +501,7 @@ Status interpretation:
 | value                  | meaning                                                 |
 |------------------------|---------------------------------------------------------|
 | `0..=255`              | child's exit code; `128 + signo` if killed by a signal  |
-| `-1` (`ERR_NO_RULE`)   | no rule matched (or regex rejected slot)                |
+| `-1` (`ERR_NO_RULE`)   | no rule matched (regex, arity, or option-like value)    |
 | `-2` (`ERR_PROTO`)     | protocol error or recv timeout                          |
 | `-3` (`ERR_FDS`)       | wrong fd count (≠ 3 attached)                           |
 | `-4` (`ERR_SPAWN`)     | fork/exec failed                                        |

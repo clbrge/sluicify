@@ -296,15 +296,19 @@ node /usr/local/share/sluice/sluicify.js /run/agent.sock make -C /work test
 stdio is byte-for-byte: `git status`'s output appears on the agent's
 stdout exactly as if it had run locally, exit code propagates.
 
-A request that doesn't match any rule (or trips a regex) returns
-exit `129` — `128 + |ERR_NO_RULE|`:
+A request that doesn't match any rule (or trips a regex, or puts a
+`-`-prefixed value in a slot not listed in `allow_dash`) returns exit
+`129` — `128 + |ERR_NO_RULE|`:
 
 ```sh
 $ sluicify /run/agent.sock cat /etc/passwd
-sluicify: sluice error status -1
+sluicify: No matching rule for command: cat
 $ echo $?
 129
 ```
+
+A rule timeout exits `124` (as GNU `timeout`); a child killed by a
+signal exits `128 + signo`.
 
 ### 6. Inspect the audit log
 
@@ -312,14 +316,18 @@ Every accepted call shows up as a `start`/`exit` pair in the manifest;
 rejected calls as `reject`:
 
 ```sh
-$ jq -c '{call,kind,argv,status,duration_ms}' \
+$ jq -c '{call,kind,argv,resolved,reason,status,duration_ms}
+         | with_entries(select(.value != null))' \
     < ~/.local/state/sluice/manifest.jsonl
-{"call":1,"kind":"start","argv":["git","-C","/home/you/work","status"]}
+{"call":1,"kind":"start","argv":["git","-C","/home/you/work","status"],"resolved":"/usr/bin/git"}
 {"call":1,"kind":"exit","status":0,"duration_ms":42}
-{"call":2,"kind":"start","argv":["git","-C","/home/you/work","commit","-m","fix: handle empty input"]}
+{"call":2,"kind":"start","argv":["git","-C","/home/you/work","commit","-m","fix: handle empty input"],"resolved":"/usr/bin/git"}
 {"call":2,"kind":"exit","status":0,"duration_ms":118}
-{"call":3,"kind":"reject","argv":["cat","/etc/passwd"]}
+{"call":3,"kind":"reject","argv":["cat","/etc/passwd"],"reason":"no_rule"}
 ```
+
+`resolved` is the binary that actually ran; `argv[0]` is only what the
+caller sent.
 
 And every accepted call's actual stdout/stderr are byte-identical
 sidecars:

@@ -9,75 +9,79 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
-### Added
+### Upgrading
 
-- Rules: `$HOME` / `${HOME}` and `$XDG_RUNTIME_DIR` / `${XDG_RUNTIME_DIR}`
-  are expanded in `logfile`, `stdoutfile`, `stderrfile`, and `cwd`
-  (defaults and per-rule). Expansion happens once at parse / `SIGHUP`
-  reload using the broker's environment, so rules files can be shared
-  across users without per-user editing. Allowlist is intentionally
-  tight: any other `$VAR` is a parse error, as is an unset allowlisted
-  var (no silent empty splices). The existing `#$slot` syntax is
-  unaffected and composes naturally (`$HOME/log/c#$call.out`).
-- `allow_dash` and `allow_any` rule attributes, listing slots that may
-  take option-like values or any value. `sluice check` lists them.
+- Every slot needs a regex or an `allow_any` entry; a rules file with a
+  bare slot no longer parses. Run the new `sluice check` on your rules
+  before restarting the broker.
+- Slot values starting with `-` are refused unless the slot is listed
+  in `allow_dash`.
+- Clients that interpret wire status: `-5` is no longer sent (signal
+  deaths are `128 + signo`); handle `-7` (`ERR_TIMEOUT`) and `-8`
+  (`ERR_PEER`).
 
-### Changed
+### Security
 
-- **Rules:** every slot needs a regex unless listed in `allow_any`, and
-  slot values starting with `-` are refused unless the slot is listed
-  in `allow_dash` (reject reason `option_like`).
-- **Wire protocol:** a child killed by a signal now reports `128 +
-  signo` instead of `ERR_SIGNALED` (-5, no longer sent). A fired rule
-  timeout reports the new `ERR_TIMEOUT` (-7); `sluicify` and the
-  example clients exit 124 for it.
-- `sluicify` client errors are now ssh-style one-liners. `sluice error
-  status -4` becomes `Failed to spawn <cmd> (exec error)`; `connect:
-  ENOENT` becomes `Broker not running: no socket at <path>`. Each
-  broker error code maps to a distinct message.
-- Manifest: start events carry `"resolved"` (the binary executed);
-  exit events carry `"signal"` and `"timed_out"` when set. An
-  executable that doesn't resolve is a `reject` (`exe_unresolved`)
-  instead of a start/exit pair.
-- Rule attribute values: a value starting with a quote is one quoted
-  word, so it can contain `;`; otherwise quotes are literal and `;`
-  starts a comment unless written `\;`.
+- Slot regexes are anchored as `^(?:…)$`, so every branch of an
+  alternation must match the whole value and a trailing `\$` is not
+  taken for an end anchor.
+- Every slot needs a regex unless listed in `allow_any`, and values
+  starting with `-` are refused unless the slot is listed in
+  `allow_dash` (reject reason `option_like`).
+- Fds passed with a malformed request or the wrong fd count are closed
+  instead of leaking in the broker.
+- Received fds are close-on-exec atomically (`MSG_CMSG_CLOEXEC`), so a
+  concurrent spawn can't inherit another caller's stdio.
 - `sluice serve` refuses to start when another broker is listening on
   the socket path, instead of unlinking it.
 
+### Added
+
+- `allow_dash` and `allow_any` rule attributes. `sluice check` lists
+  every slot they widen.
+- `$HOME` and `$XDG_RUNTIME_DIR` (also `${…}`) expand in `logfile`,
+  `stdoutfile`, `stderrfile` and `cwd`, once at parse or `SIGHUP`
+  reload. Any other `$VAR`, or an unset one, is a parse error.
+- Wire status `ERR_TIMEOUT` (-7) when a rule timeout fires; `sluicify`
+  and the example clients exit 124 for it.
+- Wire status `ERR_PEER` (-8) when the caller's `SO_PEERCRED` can't be
+  read (reject reason `peer_unknown`).
+- Manifest: `"resolved"` (the binary executed) on start events;
+  `"signal"`, `"timed_out"` and `"drain_timeout"` on exit events when
+  set.
+
+### Changed
+
+- A child killed by a signal reports `128 + signo`.
+- With `stdoutfile`/`stderrfile`, the reply goes out when the child
+  exits. Output from background processes still holding the pipe is
+  captured until they close it, or until the rule's timeout + 2 s; the
+  exit event is written then.
+- An executable that doesn't resolve via `exec_path` is a `reject`
+  (`exe_unresolved`) instead of a start/exit pair.
+- Rule attribute values: a value starting with a quote is one quoted
+  word and may contain `;`. Otherwise quotes are literal and `;` starts
+  a comment unless written `\;`.
+- A per-rule `logfile` is a parse error.
+- `sluicify` prints one actionable line per error, e.g. `No matching
+  rule for command: <cmd>` or `Broker not running: no socket at <path>`.
+
+### Removed
+
+- Wire status `ERR_SIGNALED` (-5).
+
 ### Fixed
 
-- Requests with trailing bytes or truncated by the receive buffer are
-  rejected.
-- `sluice check` reports the number of slots, not the number of slot
-  regexes.
-- `sluicify` reports a non-UTF-8 argument instead of panicking.
-- Slot regexes are anchored as `^(?:…)$`. Previously `a|b` became
-  `^a|b$` (each branch anchored on one side only) and a trailing `\$`
-  counted as an end anchor. **Behavior change:** values that only
-  matched through the partial anchor are now rejected.
-- Fds passed with a malformed request or with the wrong fd count are
-  closed instead of leaking in the broker.
-- Received fds are marked close-on-exec atomically
-  (`MSG_CMSG_CLOEXEC`), so a concurrent spawn can't inherit another
-  caller's stdio.
-- With `stdoutfile`/`stderrfile`, the reply no longer waits for
-  background processes that hold the child's stdout/stderr; it goes out
-  when the child exits, as in direct mode. Capture continues until they
-  close the pipe or until the rule's timeout + 2 s, and the exit event
-  is written then (`"drain_timeout":true` when cut).
-- A `timeout` is still enforced when `pidfd_open` or `poll` fails
-  (e.g. EMFILE); the child was previously sent `SIGTERM` immediately,
-  or never killed on a `poll` error.
-- A per-rule `logfile` is a parse error; it was accepted and ignored.
-- A panicking connection handler or a failed thread spawn no longer
-  leaks a concurrency slot or takes down the accept loop.
-- A call whose peer credentials can't be read is refused with the new
-  `ERR_PEER` (-8), reject reason `peer_unknown`, instead of being
-  logged as pid/uid 0.
-- Spawned children start with an empty signal mask and default
-  `SIGPIPE`; they previously inherited `SIGHUP` blocked and `SIGPIPE`
+- Spawned children no longer inherit `SIGHUP` blocked and `SIGPIPE`
   ignored.
+- A `timeout` is enforced by polling when `pidfd_open` or `poll` fails
+  (e.g. EMFILE), instead of killing the child at once or never.
+- A panicking connection handler or a failed thread spawn no longer
+  leaks a concurrency slot or stops the accept loop.
+- Requests with trailing bytes, or truncated by the receive buffer, are
+  rejected.
+- `sluice check` reports the number of slots, not of slot regexes.
+- `sluicify` reports a non-UTF-8 argument instead of panicking.
 
 ## [0.1.0] - 2026-05-06
 
