@@ -9,6 +9,11 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Added
+
+- `sluicify --version` / `-V` and `--help` / `-h`, as the first argument
+  only; after the socket path every argument belongs to the command.
+
 ## [0.2.1] - 2026-10-05
 
 ### Changed

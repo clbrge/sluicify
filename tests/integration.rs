@@ -446,3 +446,35 @@ fn option_like_value_rejected_with_reason() {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "plain");
 }
+
+#[test]
+fn client_version_and_help_as_first_argument() {
+    let version = Command::new(SLUICIFY_BIN)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("sluicify {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let short = Command::new(SLUICIFY_BIN).arg("-V").output().unwrap();
+    assert_eq!(short.stdout, version.stdout);
+
+    let help = Command::new(SLUICIFY_BIN).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).starts_with("usage: sluicify <socket>"));
+
+    let missing = Command::new(SLUICIFY_BIN).output().unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+}
+
+#[test]
+fn client_flags_after_the_socket_belong_to_the_command() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n\nprintf '%s\\n' #1\n  1 = ^--version$\n  allow_dash = 1\n",
+    );
+    let (code, stdout, _) = broker.call(&["printf", "%s\\n", "--version"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "--version");
+}

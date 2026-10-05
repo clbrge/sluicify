@@ -11,6 +11,7 @@
 //!
 //! Usage:
 //!     sluicify <socket> <cmd> [args...]
+//!     sluicify --version | --help
 //!
 //! Exit code:
 //!     n in 0..=255  — the spawned child's exit code (128 + signo when
@@ -64,12 +65,25 @@ fn broker_error_message(status: i32, cmd: &str) -> String {
 }
 
 fn main() -> ExitCode {
-    const USAGE: &str = "usage: sluicify <socket> <cmd> [args...]";
+    const USAGE: &str =
+        "usage: sluicify <socket> <cmd> [args...]\n       sluicify --version | --help";
     let mut args = std::env::args_os().skip(1);
-    let Some(sock_path) = args.next().map(PathBuf::from) else {
+    let Some(first) = args.next() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    match first.to_str() {
+        Some("--version" | "-V") => {
+            println!("sluicify {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+    let sock_path = PathBuf::from(first);
     let mut argv: Vec<String> = Vec::new();
     for (i, a) in args.enumerate() {
         match a.into_string() {
