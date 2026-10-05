@@ -1,3 +1,7 @@
 /target
 Cargo.lock.bak
 *.swp
+
+# Local-only convenience helpers (release, dev shortcuts, etc.).
+/Makefile
+/.release-notes.tmp

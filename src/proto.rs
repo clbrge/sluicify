@@ -164,7 +164,10 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(b"a\0b");
-        assert!(matches!(decode_request(&buf), Err(DecodeError::EmbeddedNul)));
+        assert!(matches!(
+            decode_request(&buf),
+            Err(DecodeError::EmbeddedNul)
+        ));
     }
 
     #[test]

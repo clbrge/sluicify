@@ -13,16 +13,18 @@
 
 use crate::log::CallId;
 use crate::proto::{ERR_SIGNALED, ERR_SPAWN};
-use crate::rules::{EnvPolicy, ExecPath, ExeMatch, Rule, Rules};
+use crate::rules::{EnvPolicy, ExeMatch, ExecPath, Rule, Rules};
 use nix::fcntl::OFlag;
 use nix::libc;
-use nix::sys::signal::{kill, killpg, Signal};
+use nix::sys::signal::{
+    kill, killpg, pthread_sigmask, signal, SigHandler, SigSet, SigmaskHow, Signal,
+};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{chdir, dup2, execve, fork, getpgid, pipe2, setpgid, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -136,7 +138,10 @@ pub fn run_matched(
         .filter_map(|s| CString::new(s.as_bytes()).ok())
         .collect();
     if argv_c.len() != argv.len() {
-        return SpawnOutcome { status: ERR_SPAWN, ..Default::default() };
+        return SpawnOutcome {
+            status: ERR_SPAWN,
+            ..Default::default()
+        };
     }
     let envp_c: Vec<CString> = envp
         .iter()
@@ -153,12 +158,20 @@ pub fn run_matched(
                 "sluice: cannot resolve executable for rule at line {} (exec_path miss)",
                 rule.line_no
             );
-            return SpawnOutcome { status: ERR_SPAWN, ..Default::default() };
+            return SpawnOutcome {
+                status: ERR_SPAWN,
+                ..Default::default()
+            };
         }
     };
     let resolved_c = match CString::new(resolved.as_os_str().as_encoded_bytes()) {
         Ok(c) => c,
-        Err(_) => return SpawnOutcome { status: ERR_SPAWN, ..Default::default() },
+        Err(_) => {
+            return SpawnOutcome {
+                status: ERR_SPAWN,
+                ..Default::default()
+            }
+        }
     };
 
     let _ = Instant::now(); // start tracked in main
@@ -176,8 +189,18 @@ pub fn run_matched(
             ctx.unwrap(),
         )
     } else {
-        let status = run_direct(stdio, &resolved_c, &argv_c, &envp_c, cwd.as_deref(), timeout);
-        SpawnOutcome { status, ..Default::default() }
+        let status = run_direct(
+            stdio,
+            &resolved_c,
+            &argv_c,
+            &envp_c,
+            cwd.as_deref(),
+            timeout,
+        );
+        SpawnOutcome {
+            status,
+            ..Default::default()
+        }
     }
 }
 
@@ -197,6 +220,7 @@ fn run_direct(
     match unsafe { fork() } {
         Err(_) => ERR_SPAWN,
         Ok(ForkResult::Child) => {
+            reset_child_signals();
             // Become own process-group leader. Both parent and child
             // call setpgid to close the race window — whichever lands
             // first wins, the other returns EACCES (harmless).
@@ -234,11 +258,21 @@ fn run_with_tee(
 
     let (pout_r, pout_w) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(p) => p,
-        Err(_) => return SpawnOutcome { status: ERR_SPAWN, ..Default::default() },
+        Err(_) => {
+            return SpawnOutcome {
+                status: ERR_SPAWN,
+                ..Default::default()
+            }
+        }
     };
     let (perr_r, perr_w) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(p) => p,
-        Err(_) => return SpawnOutcome { status: ERR_SPAWN, ..Default::default() },
+        Err(_) => {
+            return SpawnOutcome {
+                status: ERR_SPAWN,
+                ..Default::default()
+            }
+        }
     };
 
     let stdin_raw = stdin_fd.as_raw_fd();
@@ -246,8 +280,12 @@ fn run_with_tee(
     let perr_w_raw = perr_w.as_raw_fd();
 
     match unsafe { fork() } {
-        Err(_) => SpawnOutcome { status: ERR_SPAWN, ..Default::default() },
+        Err(_) => SpawnOutcome {
+            status: ERR_SPAWN,
+            ..Default::default()
+        },
         Ok(ForkResult::Child) => {
+            reset_child_signals();
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
             if dup2(stdin_raw, 0).is_err()
                 || dup2(pout_w_raw, 1).is_err()
@@ -269,10 +307,8 @@ fn run_with_tee(
             drop(perr_w);
             drop(stdin_fd);
 
-            let h_out =
-                std::thread::spawn(move || relay(pout_r, stdout_fd, ctx.stdout_sink));
-            let h_err =
-                std::thread::spawn(move || relay(perr_r, stderr_fd, ctx.stderr_sink));
+            let h_out = std::thread::spawn(move || relay(pout_r, stdout_fd, ctx.stdout_sink));
+            let h_err = std::thread::spawn(move || relay(perr_r, stderr_fd, ctx.stderr_sink));
 
             let status = wait_child_with_timeout(child, timeout);
 
@@ -341,6 +377,13 @@ fn write_all(fd: &OwnedFd, mut buf: &[u8]) -> Result<(), nix::errno::Errno> {
         }
     }
     Ok(())
+}
+
+/// Both survive execve: the Rust runtime ignores SIGPIPE at startup and
+/// `serve` blocks SIGHUP for its sigwait thread.
+fn reset_child_signals() {
+    let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
+    let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
 }
 
 fn wait_child(pid: Pid) -> i32 {
@@ -537,8 +580,8 @@ mod tests {
         // env policy lists PATH (so it would be inherited), but exec_path
         // is the source of truth. We assert PATH is from exec_path, not
         // from std::env::var("PATH").
-        let r = parse("defaults:\n  env = PATH\n  exec_path = /opt/sluice-test-bin\n\necho\n")
-            .unwrap();
+        let r =
+            parse("defaults:\n  env = PATH\n  exec_path = /opt/sluice-test-bin\n\necho\n").unwrap();
         let envp = build_envp(&r.rules[0], &r);
         let path = envp.iter().find(|(k, _)| k == "PATH").unwrap();
         assert_eq!(path.1, "/opt/sluice-test-bin");
@@ -548,12 +591,7 @@ mod tests {
     #[test]
     fn build_argv_for_bare_name_keeps_token_count() {
         let r = parse("git log -n #1\n").unwrap();
-        let caller = vec![
-            "git".into(),
-            "log".into(),
-            "-n".into(),
-            "5".into(),
-        ];
+        let caller = vec!["git".into(), "log".into(), "-n".into(), "5".into()];
         let argv = build_argv(&r.rules[0], &caller);
         assert_eq!(argv, vec!["git", "log", "-n", "5"]);
     }

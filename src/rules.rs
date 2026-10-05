@@ -238,7 +238,7 @@ pub fn parse(input: &str) -> Result<Rules, ParseError> {
         if stripped.trim().is_empty() {
             continue;
         }
-        let indented = stripped.starts_with(|c: char| c == ' ' || c == '\t');
+        let indented = stripped.starts_with([' ', '\t']);
         if indented {
             let (key, val) = split_attr(stripped, line_no)?;
             apply_attr(&mut current, &mut defaults, &mut rules, key, val, line_no)?;
@@ -345,7 +345,7 @@ fn apply_default_attr(
 ) -> Result<(), ParseError> {
     match key {
         "timeout" => d.timeout = Some(parse_duration(val, line_no)?),
-        "cwd" => d.cwd = Some(PathBuf::from(val)),
+        "cwd" => d.cwd = Some(expand_path_field(val, line_no)?),
         "env" => d.env = parse_env(val, line_no)?,
         "log" => d.log = parse_log(val, line_no)?,
         "logfile" => d.logfile = Some(parse_path_template(val, line_no)?),
@@ -412,14 +412,92 @@ fn parse_exec_path(val: &str, line_no: usize) -> Result<ExecPath, ParseError> {
 }
 
 fn parse_path_template(val: &str, line_no: usize) -> Result<PathTemplate, ParseError> {
-    let t = PathTemplate {
-        raw: val.to_string(),
-    };
+    let expanded = expand_env_vars(val).map_err(|e| ParseError {
+        line_no,
+        message: e,
+    })?;
+    let t = PathTemplate { raw: expanded };
     t.validate().map_err(|e| ParseError {
         line_no,
         message: format!("invalid path template: {e}"),
     })?;
     Ok(t)
+}
+
+/// Whitelist of environment variables that may appear in path-shaped
+/// rule fields. Kept tiny on purpose: a rules file ought to be portable
+/// between users on the same machine (so HOME) and able to land its
+/// audit sinks on a user-private tmpfs (so XDG_RUNTIME_DIR), but not
+/// reach into PATH or arbitrary process state where typos and shell
+/// injection patterns become hard to reason about.
+const ALLOWED_ENV_VARS: &[&str] = &["HOME", "XDG_RUNTIME_DIR"];
+
+/// Expand `$HOME` / `${HOME}` and `$XDG_RUNTIME_DIR` / `${XDG_RUNTIME_DIR}`
+/// at parse time. Any other `$NAME` or `${NAME}` is rejected so a typo
+/// like `$HOMW` doesn't silently end up as a literal directory name.
+/// Unset allowed vars are also rejected — better a loud parse error
+/// than an empty string spliced into an audit path.
+fn expand_env_vars(input: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(idx) = rest.find('$') {
+        // `#$slot` is the per-call system-slot syntax handled by
+        // PathTemplate::resolve — leave it alone.
+        if idx > 0 && rest.as_bytes()[idx - 1] == b'#' {
+            out.push_str(&rest[..idx + 1]);
+            rest = &rest[idx + 1..];
+            continue;
+        }
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 1..];
+        let (name, advance, braced) = if let Some(after_brace) = after.strip_prefix('{') {
+            let close = after_brace
+                .find('}')
+                .ok_or_else(|| format!("unterminated '${{' in {input:?}"))?;
+            (&after_brace[..close], close + 2 + 1, true)
+        } else {
+            let end = after
+                .bytes()
+                .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                .unwrap_or(after.len());
+            if end == 0 {
+                out.push('$');
+                rest = after;
+                continue;
+            }
+            (&after[..end], end + 1, false)
+        };
+        if !ALLOWED_ENV_VARS.contains(&name) {
+            let token = if braced {
+                format!("${{{name}}}")
+            } else {
+                format!("${name}")
+            };
+            return Err(format!(
+                "unsupported variable {token} in path \
+                 (only $HOME and $XDG_RUNTIME_DIR are allowed)"
+            ));
+        }
+        let val = std::env::var(name).map_err(|_| {
+            format!("environment variable ${name} is not set; cannot expand path {input:?}")
+        })?;
+        out.push_str(&val);
+        rest = &rest[idx + advance..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Same allowlisted env expansion as path templates, but for plain
+/// path fields (e.g. `cwd`) that don't carry `#$` slots. Kept as a
+/// thin wrapper so the call sites read symmetrically.
+fn expand_path_field(val: &str, line_no: usize) -> Result<PathBuf, ParseError> {
+    expand_env_vars(val)
+        .map(PathBuf::from)
+        .map_err(|e| ParseError {
+            line_no,
+            message: e,
+        })
 }
 
 fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result<(), ParseError> {
@@ -432,7 +510,7 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
             return Ok(());
         }
         "cwd" => {
-            r.cwd = Some(PathBuf::from(val));
+            r.cwd = Some(expand_path_field(val, line_no)?);
             return Ok(());
         }
         "env" => {
@@ -462,7 +540,11 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
         _ => {}
     }
     if let Some(slot) = parse_slot_id_bare(key) {
-        if !r.tokens.iter().any(|t| matches!(t, TokenPattern::Slot(s) if s == &slot)) {
+        if !r
+            .tokens
+            .iter()
+            .any(|t| matches!(t, TokenPattern::Slot(s) if s == &slot))
+        {
             return Err(ParseError {
                 line_no,
                 message: format!("regex for {slot} but rule has no such slot"),
@@ -483,19 +565,14 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
 }
 
 fn anchor_regex(re: &str) -> String {
-    let starts = re.starts_with('^');
-    let ends = re.ends_with('$');
-    match (starts, ends) {
-        (true, true) => re.to_string(),
-        (true, false) => format!("{re}$"),
-        (false, true) => format!("^{re}"),
-        (false, false) => format!("^{re}$"),
-    }
+    format!("^(?:{re})$")
 }
 
 fn parse_duration(val: &str, line_no: usize) -> Result<Duration, ParseError> {
     let v = val.trim();
-    let (num_part, unit) = v.find(|c: char| c.is_alphabetic()).map_or((v, ""), |i| v.split_at(i));
+    let (num_part, unit) = v
+        .find(|c: char| c.is_alphabetic())
+        .map_or((v, ""), |i| v.split_at(i));
     let n: u64 = num_part.parse().map_err(|_| ParseError {
         line_no,
         message: format!("invalid duration: {val:?}"),
@@ -532,9 +609,7 @@ fn parse_env(val: &str, line_no: usize) -> Result<EnvPolicy, ParseError> {
         });
     }
     for n in &names {
-        if !n
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             || n.chars().next().is_some_and(|c| c.is_ascii_digit())
         {
             return Err(ParseError {
@@ -733,6 +808,13 @@ impl Rules {
 }
 
 impl Rule {
+    pub fn unconstrained_slots(&self) -> impl Iterator<Item = &SlotId> {
+        self.tokens.iter().filter_map(|t| match t {
+            TokenPattern::Slot(id) if !self.slot_regex.contains_key(id) => Some(id),
+            _ => None,
+        })
+    }
+
     fn try_match(&self, argv: &[String]) -> Option<Match<'_>> {
         // Executable
         match &self.exe {
@@ -832,6 +914,49 @@ mod tests {
     }
 
     #[test]
+    fn alternation_is_anchored_on_every_branch() {
+        let r = parse("git checkout #1\n  1 = main|develop\n").unwrap();
+        let m = |v: &str| {
+            r.match_argv(&["git".into(), "checkout".into(), v.into()])
+                .is_some()
+        };
+        assert!(m("main"));
+        assert!(m("develop"));
+        assert!(!m("main--evil"));
+        assert!(!m("--upload-pack=x develop"));
+    }
+
+    #[test]
+    fn user_anchored_alternation_is_still_anchored() {
+        let r = parse("git checkout #1\n  1 = ^main|develop$\n").unwrap();
+        let m = |v: &str| {
+            r.match_argv(&["git".into(), "checkout".into(), v.into()])
+                .is_some()
+        };
+        assert!(m("main"));
+        assert!(!m("mainX"));
+        assert!(!m("Xdevelop"));
+    }
+
+    #[test]
+    fn escaped_dollar_is_not_an_end_anchor() {
+        let r = parse("echo #1\n  1 = ^[a-z]+\\$\n").unwrap();
+        let m = |v: &str| r.match_argv(&["echo".into(), v.into()]).is_some();
+        assert!(m("abc$"));
+        assert!(!m("abc$;rm"));
+    }
+
+    #[test]
+    fn unconstrained_slots_lists_slots_without_regex() {
+        let r = parse("rsync -a #src #dst #3\n  src = ^[a-z]+$\n").unwrap();
+        let free: Vec<String> = r.rules[0]
+            .unconstrained_slots()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(free, vec!["#dst", "#3"]);
+    }
+
+    #[test]
     fn match_arity_mismatch() {
         let r = parse("git log -n #1\n").unwrap();
         let no = r.match_argv(&["git".into(), "log".into(), "-n".into()]);
@@ -841,17 +966,9 @@ mod tests {
     #[test]
     fn match_named_slot() {
         let r = parse("rsync -a #src #dst\n  src = ^[a-z]+$\n  dst = ^[a-z]+$\n").unwrap();
-        let m = r.match_argv(&[
-            "rsync".into(),
-            "-a".into(),
-            "foo".into(),
-            "bar".into(),
-        ]);
+        let m = r.match_argv(&["rsync".into(), "-a".into(), "foo".into(), "bar".into()]);
         let m = m.unwrap();
-        assert_eq!(
-            m.bindings.get(&SlotId::Name("src".into())).unwrap(),
-            "foo"
-        );
+        assert_eq!(m.bindings.get(&SlotId::Name("src".into())).unwrap(), "foo");
     }
 
     #[test]
@@ -984,5 +1101,85 @@ mod tests {
         let src = "git log\n  stdoutfile = /var/log/#$nope.out\n";
         let err = parse(src).unwrap_err();
         assert!(err.message.contains("unknown system slot"));
+    }
+
+    #[test]
+    fn expands_home_in_stdoutfile() {
+        std::env::set_var("HOME", "/home/test");
+        let src = "git log\n  stdoutfile = $HOME/tmp/c#$call.out\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.rules[0].stdoutfile.as_ref().unwrap().raw,
+            "/home/test/tmp/c#$call.out"
+        );
+    }
+
+    #[test]
+    fn expands_braced_home_in_logfile() {
+        std::env::set_var("HOME", "/home/test");
+        let src = "defaults:\n  logfile = ${HOME}/.local/state/sluice/manifest.jsonl\n\ngit log\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.defaults.logfile.as_ref().unwrap().raw,
+            "/home/test/.local/state/sluice/manifest.jsonl"
+        );
+    }
+
+    #[test]
+    fn expands_xdg_runtime_dir() {
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        let src = "git log\n  stdoutfile = $XDG_RUNTIME_DIR/sluice/c#$call.out\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.rules[0].stdoutfile.as_ref().unwrap().raw,
+            "/run/user/1000/sluice/c#$call.out"
+        );
+    }
+
+    #[test]
+    fn expands_home_in_cwd() {
+        std::env::set_var("HOME", "/home/test");
+        let src = "git log\n  cwd = $HOME/projects/repo\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.rules[0].cwd.as_ref().unwrap(),
+            &PathBuf::from("/home/test/projects/repo")
+        );
+    }
+
+    #[test]
+    fn rejects_non_allowlisted_env_var() {
+        let src = "git log\n  stdoutfile = $PATH/sluice.out\n";
+        let err = parse(src).unwrap_err();
+        assert!(err.message.contains("unsupported variable"));
+        assert!(err.message.contains("$PATH"));
+    }
+
+    #[test]
+    fn rejects_unset_home() {
+        std::env::remove_var("HOME");
+        let src = "git log\n  stdoutfile = $HOME/sluice.out\n";
+        let err = parse(src).unwrap_err();
+        assert!(err.message.contains("not set"));
+        // Restore so other tests aren't affected.
+        std::env::set_var("HOME", "/home/test");
+    }
+
+    #[test]
+    fn rejects_unterminated_brace() {
+        std::env::set_var("HOME", "/home/test");
+        let src = "git log\n  stdoutfile = ${HOME/x.out\n";
+        let err = parse(src).unwrap_err();
+        assert!(err.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn lone_dollar_kept_literal() {
+        let src = "git log\n  stdoutfile = /var/log/sluice$.out\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.rules[0].stdoutfile.as_ref().unwrap().raw,
+            "/var/log/sluice$.out"
+        );
     }
 }

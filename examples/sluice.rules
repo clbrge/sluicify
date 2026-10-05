@@ -27,6 +27,12 @@
 ;     #$ts     unix epoch seconds
 ;     #$ts_ms  unix epoch milliseconds
 ;
+; Path-shaped fields (logfile, stdoutfile, stderrfile, cwd) also expand
+; $HOME and $XDG_RUNTIME_DIR (and ${HOME} / ${XDG_RUNTIME_DIR}) once at
+; parse time using the broker's environment. Any other $VAR is rejected
+; at parse time. This lets a single rules file be shared between users
+; on the same machine.
+;
 ; A path that contains #$call (or #$ts_ms) is unique per call, so the
 ; resulting files are pure byte streams that any standard tool — cat,
 ; grep, jq, csv — parses unchanged.

@@ -202,6 +202,13 @@ The heredoc lets `$HOME` expand (so the rules file ends up with your
 real home directory baked in) but escapes `\$call` / `\$` so sluice's
 slot syntax and end-of-line regex anchors survive.
 
+If you'd rather keep `$HOME` literal in the file (e.g. checking the
+rules into a dotfiles repo shared between users), sluice expands
+`$HOME` and `$XDG_RUNTIME_DIR` itself at parse time — see
+[REFERENCE.md → Environment-variable expansion](REFERENCE.md#environment-variable-expansion).
+No other `$VAR` is allowed; typos and unset vars fail loudly at parse
+time rather than landing audit data in a literal `$HOMW` directory.
+
 Test it without running the broker:
 
 ```sh

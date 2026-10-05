@@ -87,6 +87,14 @@ fn check(path: &Path) -> ExitCode {
             r.slot_regex.len()
         );
     }
+    for r in &rules.rules {
+        for slot in r.unconstrained_slots() {
+            println!(
+                "warning: line {}: slot {slot} has no regex — accepts any value, including option flags",
+                r.line_no
+            );
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -417,9 +425,10 @@ fn resolve_manifest_path(rules: &Rules) -> Option<PathBuf> {
     Some(t.resolve(&ctx))
 }
 
-fn effective_path<'a>(rule_attr: Option<&'a PathTemplate>, default_attr: Option<&'a PathTemplate>)
-    -> Option<&'a PathTemplate>
-{
+fn effective_path<'a>(
+    rule_attr: Option<&'a PathTemplate>,
+    default_attr: Option<&'a PathTemplate>,
+) -> Option<&'a PathTemplate> {
     rule_attr.or(default_attr)
 }
 
@@ -459,16 +468,7 @@ fn handle_conn(
                     }
                     ERR_NO_RULE
                 }
-                Some(m) => dispatch(
-                    m.rule,
-                    rules,
-                    &req,
-                    stdio,
-                    &conn,
-                    manifest,
-                    &sinks,
-                    &call_counter,
-                ),
+                Some(m) => dispatch(m.rule, &snap, &req, stdio, &conn, &sinks, &call_counter),
             },
         },
         Err(()) => ERR_PROTO,
@@ -485,14 +485,15 @@ fn handle_conn(
 
 fn dispatch(
     rule: &rules::Rule,
-    rules: &Rules,
+    snap: &LiveState,
     req: &Request,
     stdio: [OwnedFd; 3],
     conn: &OwnedFd,
-    manifest: &Option<Arc<Logger>>,
     sinks: &Arc<SinkCache>,
     call_counter: &Arc<AtomicU64>,
 ) -> i32 {
+    let rules: &Rules = &snap.rules;
+    let manifest = &snap.manifest;
     let peer = peer_of(conn);
     let peer_pid = peer.map(|p| p.pid).unwrap_or(0);
     let peer_uid = peer.map(|p| p.uid).unwrap_or(0);
@@ -542,29 +543,32 @@ fn dispatch(
     let stderr_path = stderr_tmpl.map(|t| t.resolve(&path_ctx));
 
     let mut sink_open_failed: Option<String> = None;
-    let stdout_sink = stdout_path.as_ref().and_then(|p| match sinks.get_or_open(p) {
-        Ok(file) => Some(TeeSink {
-            file,
-            bytes: Arc::new(AtomicU64::new(0)),
-        }),
-        Err(e) => {
-            eprintln!("sluice: cannot open stdoutfile {}: {e}", p.display());
-            sink_open_failed = Some(format!("stdoutfile {}: {e}", p.display()));
-            None
-        }
-    });
-    let stderr_sink = stderr_path.as_ref().and_then(|p| match sinks.get_or_open(p) {
-        Ok(file) => Some(TeeSink {
-            file,
-            bytes: Arc::new(AtomicU64::new(0)),
-        }),
-        Err(e) => {
-            eprintln!("sluice: cannot open stderrfile {}: {e}", p.display());
-            sink_open_failed
-                .get_or_insert_with(|| format!("stderrfile {}: {e}", p.display()));
-            None
-        }
-    });
+    let stdout_sink = stdout_path
+        .as_ref()
+        .and_then(|p| match sinks.get_or_open(p) {
+            Ok(file) => Some(TeeSink {
+                file,
+                bytes: Arc::new(AtomicU64::new(0)),
+            }),
+            Err(e) => {
+                eprintln!("sluice: cannot open stdoutfile {}: {e}", p.display());
+                sink_open_failed = Some(format!("stdoutfile {}: {e}", p.display()));
+                None
+            }
+        });
+    let stderr_sink = stderr_path
+        .as_ref()
+        .and_then(|p| match sinks.get_or_open(p) {
+            Ok(file) => Some(TeeSink {
+                file,
+                bytes: Arc::new(AtomicU64::new(0)),
+            }),
+            Err(e) => {
+                eprintln!("sluice: cannot open stderrfile {}: {e}", p.display());
+                sink_open_failed.get_or_insert_with(|| format!("stderrfile {}: {e}", p.display()));
+                None
+            }
+        });
 
     // Strict audit: refuse to execute when a configured sink is
     // unwritable. Without this, an operator running sluice for
@@ -626,8 +630,12 @@ fn dispatch(
     } else {
         None
     };
-    let SpawnOutcome { status, stdout_bytes, stderr_bytes, sink_failed } =
-        run_matched(rule, rules, &req.argv, stdio, ctx);
+    let SpawnOutcome {
+        status,
+        stdout_bytes,
+        stderr_bytes,
+        sink_failed,
+    } = run_matched(rule, rules, &req.argv, stdio, ctx);
     let dur_ms = started.elapsed().as_millis() as u64;
 
     // A sink write failed mid-call. Mid-call we can't undo — the child
@@ -645,7 +653,14 @@ fn dispatch(
     }
 
     if let (Some(l), Some(call)) = (manifest, call_id) {
-        l.exit(call, status, dur_ms, stdout_bytes, stderr_bytes, sink_failed);
+        l.exit(
+            call,
+            status,
+            dur_ms,
+            stdout_bytes,
+            stderr_bytes,
+            sink_failed,
+        );
     }
     status
 }
@@ -653,43 +668,33 @@ fn dispatch(
 fn recv_request(conn: &OwnedFd) -> Result<(Request, Option<[OwnedFd; 3]>), ()> {
     let mut buf = vec![0u8; MAX_PAYLOAD];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-    let mut cmsg = nix::cmsg_space!([RawFd; 3]);
+    // Sized for the kernel's per-message SCM_MAX_FD so MSG_CTRUNC can't
+    // fire: on truncation nix refuses to iterate, and the fds that did
+    // arrive would be unreachable.
+    let mut cmsg = nix::cmsg_space!([RawFd; SCM_MAX_FD]);
 
     let msg = recvmsg::<UnixAddr>(
         conn.as_raw_fd(),
         &mut iov,
         Some(&mut cmsg),
-        MsgFlags::empty(),
+        MsgFlags::MSG_CMSG_CLOEXEC,
     )
     .map_err(|_| ())?;
     let n = msg.bytes;
 
-    let mut fds_vec: Vec<RawFd> = Vec::new();
+    let mut fds: Vec<OwnedFd> = Vec::new();
     for c in msg.cmsgs().map_err(|_| ())? {
         if let ControlMessageOwned::ScmRights(rfds) = c {
-            fds_vec.extend(rfds);
+            fds.extend(
+                rfds.into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            );
         }
     }
 
     let req = decode_request(&buf[..n]).map_err(|_| ())?;
-
-    let stdio = if fds_vec.len() == 3 {
-        for fd in &fds_vec {
-            let _ = nix::fcntl::fcntl(
-                *fd,
-                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-            );
-        }
-        Some([
-            unsafe { OwnedFd::from_raw_fd(fds_vec[0]) },
-            unsafe { OwnedFd::from_raw_fd(fds_vec[1]) },
-            unsafe { OwnedFd::from_raw_fd(fds_vec[2]) },
-        ])
-    } else {
-        for fd in fds_vec {
-            let _ = nix::unistd::close(fd);
-        }
-        None
-    };
+    let stdio = <[OwnedFd; 3]>::try_from(fds).ok();
     Ok((req, stdio))
 }
+
+const SCM_MAX_FD: usize = 253;

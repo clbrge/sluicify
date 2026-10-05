@@ -151,7 +151,14 @@ impl Logger {
 use std::fmt::Write as _;
 
 fn emit_meta(s: &mut String, call: CallId, kind: &str) {
-    write!(s, "\"call\":{},\"ts\":{},\"kind\":\"{}\"", call.0, now_ms(), kind).unwrap();
+    write!(
+        s,
+        "\"call\":{},\"ts\":{},\"kind\":\"{}\"",
+        call.0,
+        now_ms(),
+        kind
+    )
+    .unwrap();
 }
 
 fn emit_argv(s: &mut String, argv: &[String]) {
@@ -293,7 +300,14 @@ mod tests {
         let c = CallId(1);
         let stdout_p = PathBuf::from("/tmp/c1.out");
         let stderr_p = PathBuf::from("/tmp/c1.err");
-        logger.start(c, 1234, 5, &["echo".into(), "hi".into()], Some(&stdout_p), Some(&stderr_p));
+        logger.start(
+            c,
+            1234,
+            5,
+            &["echo".into(), "hi".into()],
+            Some(&stdout_p),
+            Some(&stderr_p),
+        );
         logger.exit(c, 0, 7, 6, 0, false);
         drop(logger);
 
@@ -333,7 +347,10 @@ mod tests {
         let s = std::fs::read_to_string(&p).unwrap();
         let lines: Vec<&str> = s.lines().collect();
         assert!(!lines[0].contains("truncated"), "no truncated when false");
-        assert!(lines[1].contains("\"truncated\":true"), "truncated:true when set");
+        assert!(
+            lines[1].contains("\"truncated\":true"),
+            "truncated:true when set"
+        );
         cleanup(&p);
     }
 
@@ -363,7 +380,12 @@ mod tests {
     #[test]
     fn open_raw_creates_missing_parent_at_0700() {
         let p = temp_path();
-        let nested = p.parent().unwrap().join("deeper").join("subdir").join("audit");
+        let nested = p
+            .parent()
+            .unwrap()
+            .join("deeper")
+            .join("subdir")
+            .join("audit");
         // Parent of nested doesn't exist yet — open_raw must mkdir it.
         let f = open_raw(&nested).unwrap();
         drop(f);

@@ -75,6 +75,10 @@ when `audit = strict` (which is itself the default).
 | `audit`      | defaults only    | `strict`                               | What to do on audit failure                          |
 | `exec_path`  | defaults + rule  | `/bin:/usr/bin:/sbin:/usr/sbin`        | Bare-name executable lookup path                     |
 
+`cwd`, `logfile`, `stdoutfile`, and `stderrfile` accept `$HOME` and
+`$XDG_RUNTIME_DIR`; see
+[Environment-variable expansion](#environment-variable-expansion).
+
 ### `timeout = <duration>`
 
 Wall-clock cap on the spawned child. The child is `setpgid`'d into its
@@ -97,6 +101,8 @@ manifest exit event records the elapsed time.
 
 Absolute path. Child `chdir`s here just before `execve`. If the path
 doesn't exist or isn't traversable, the child exits 126 immediately.
+Accepts `$HOME` / `$XDG_RUNTIME_DIR` (see
+[Environment-variable expansion](#environment-variable-expansion)).
 
 ### `env = <policy>`
 
@@ -129,7 +135,8 @@ on `SIGHUP`).
 Path can contain system slots, but per-call slots (`#$call`) don't
 make sense here — operators wanting per-call audit use
 `stdoutfile`/`stderrfile`. Useful slots in the manifest path: `#$ts`
-for daily-stamped manifests, or none.
+for daily-stamped manifests, or none. Also accepts `$HOME` /
+`$XDG_RUNTIME_DIR` (see [Environment-variable expansion](#environment-variable-expansion)).
 
 Created with mode `0600`. The parent dir must be owner-only and
 non-writable to others (the broker rejects open if the parent is
@@ -141,8 +148,10 @@ Per-call raw stdio capture. The bytes are byte-identical to what the
 child wrote — no UTF-8 decode, no buffering, no escaping. Standard
 tools (`cat`, `grep`, `jq`, `tail -f`) work directly.
 
-Templates support all [system slots](#path-templates). Use `#$call`
-(or `#$ts_ms`) to ensure each call lands in a unique file.
+Templates support all [system slots](#path-templates) plus `$HOME` /
+`$XDG_RUNTIME_DIR` (see [Environment-variable expansion](#environment-variable-expansion)).
+Use `#$call` (or `#$ts_ms`) to ensure each call lands in a unique
+file.
 
 Same hardening as `logfile` (mode 0600, `O_NOFOLLOW`, owner-only
 parent).
@@ -182,8 +191,9 @@ git log -n #count
 
 Indented lines whose key is a slot identifier (a number `1..N` or a
 named slot like `count`) attach a regex constraint to that slot. The
-regex is **anchored implicitly** — sluice wraps with `^…$` if you
-didn't.
+regex is **anchored implicitly** — sluice always wraps it as
+`^(?:…)$`, so every branch of an alternation like `main|develop` must
+match the whole value. Your own `^`/`$` are harmless but redundant.
 
 Slot values exceeding 4 KB are rejected unconditionally.
 
@@ -238,6 +248,40 @@ Concurrent appends to the same resolved path are still serialised
 through a per-path mutex, so non-unique paths (e.g.
 `~/.local/state/sluice/by-pid/#$pid.log`) are safe — sequential calls
 from the same pid concatenate cleanly.
+
+### Environment-variable expansion
+
+Path-shaped fields — `logfile`, `stdoutfile`, `stderrfile`, and `cwd`
+(in both `defaults:` and per-rule blocks) — expand a tightly
+allowlisted set of environment variables **once at parse time** (and
+again on every `SIGHUP` reload):
+
+| token                  | source                                     |
+|------------------------|--------------------------------------------|
+| `$HOME` / `${HOME}`    | broker process's `$HOME`                   |
+| `$XDG_RUNTIME_DIR` / `${XDG_RUNTIME_DIR}` | broker's `$XDG_RUNTIME_DIR` |
+
+Anything else (`$PATH`, `$USER`, `$FOO`, …) is **rejected at parse
+time** with `unsupported variable $… (only $HOME and $XDG_RUNTIME_DIR
+are allowed)`. Typos like `$HOMW` fail loudly rather than silently
+landing audit data in a literal `$HOMW` directory. An allowlisted var
+that is unset (e.g. `$XDG_RUNTIME_DIR` under cron) is also a parse
+error, not an empty splice.
+
+The expansion uses the **broker's** environment, not the caller's —
+the rules file is the audit source of truth, not per-call state. For
+a per-user broker this is irrelevant; for a system broker it's the
+correct posture.
+
+Expansion happens before `#$slot` substitution, so the two compose:
+
+```
+stdoutfile = $HOME/.local/state/sluice/c#$call.out
+; → /home/alice/.local/state/sluice/c42.out  (call #42)
+```
+
+A lone `$` not followed by an identifier or `{` stays literal.
+`${HOME` (unterminated brace) is a parse error.
 
 ---
 
@@ -408,8 +452,10 @@ status to exit `128 + |status|` so shell pipelines can branch on it.
 
 ### `sluice check <rules-file>`
 
-Parse the file, report rule count and exe shape per rule. Returns 0 on
-success, 1 on parse error.
+Parse the file, report rule count and exe shape per rule, and print a
+warning for every slot without a regex (it accepts any value, option
+flags included). Returns 0 on success, 1 on parse error; warnings don't
+change the exit code.
 
 ```sh
 $ sluice check ~/.config/sluice/agent.rules

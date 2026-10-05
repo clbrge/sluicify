@@ -4,6 +4,10 @@
 //! tempdir, exercises a runtime path the unit tests can't reach, then
 //! kills the broker and cleans up.
 
+use nix::sys::socket;
+use sluicify::proto::{ERR_FDS, ERR_PROTO, MAGIC, VERSION};
+use std::io::{IoSlice, IoSliceMut};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -23,12 +27,11 @@ impl Broker {
         let dir = tempdir_0700();
         // The harness substitutes $DIR for the tempdir absolute path so
         // tests can write paths into the rules text without juggling.
-        let rules_text =
-            rules_text_template.replace("$DIR", dir.to_string_lossy().as_ref());
+        let rules_text = rules_text_template.replace("$DIR", dir.to_string_lossy().as_ref());
         let rules_path = dir.join("rules");
         std::fs::write(&rules_path, rules_text).unwrap();
         let socket = dir.join("sock");
-        let child = Command::new(SLUICE_BIN)
+        let mut child = Command::new(SLUICE_BIN)
             .arg("serve")
             .arg("--rules")
             .arg(&rules_path)
@@ -45,6 +48,8 @@ impl Broker {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = child.kill();
+        let _ = child.wait();
         panic!("broker didn't bind {} within 2s", socket.display());
     }
 
@@ -177,6 +182,110 @@ fn timeout_kills_grandchild_in_process_group() {
         std::thread::sleep(Duration::from_millis(100));
     }
     // Best-effort cleanup before failing.
-    let _ = Command::new("kill").arg("-9").arg(gc_pid.to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(gc_pid.to_string())
+        .status();
     panic!("grandchild pid {gc_pid} survived timeout");
+}
+
+fn raw_request(path: &std::path::Path, payload: &[u8], fds: &[RawFd]) -> i32 {
+    let sock = socket::socket(
+        socket::AddressFamily::Unix,
+        socket::SockType::SeqPacket,
+        socket::SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap();
+    socket::connect(sock.as_raw_fd(), &socket::UnixAddr::new(path).unwrap()).unwrap();
+    let cmsg = [socket::ControlMessage::ScmRights(fds)];
+    socket::sendmsg::<socket::UnixAddr>(
+        sock.as_raw_fd(),
+        &[IoSlice::new(payload)],
+        &cmsg,
+        socket::MsgFlags::empty(),
+        None,
+    )
+    .unwrap();
+    let mut reply = [0u8; 12];
+    let mut iov = [IoSliceMut::new(&mut reply)];
+    let msg = socket::recvmsg::<socket::UnixAddr>(
+        sock.as_raw_fd(),
+        &mut iov,
+        None,
+        socket::MsgFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(msg.bytes, 12);
+    i32::from_le_bytes(reply[8..12].try_into().unwrap())
+}
+
+fn encode(argv: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+    for a in argv {
+        out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        out.extend_from_slice(a.as_bytes());
+    }
+    out
+}
+
+fn open_fd_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .count()
+}
+
+#[test]
+fn rejected_requests_do_not_leak_passed_fds() {
+    let broker = Broker::start("defaults:\n  audit = best-effort\n\necho #1\n");
+    let pid = broker.child.id();
+    let before = open_fd_count(pid);
+
+    let mut bad_magic = encode(&["echo", "x"]);
+    bad_magic[0] ^= 0xff;
+    let valid = encode(&["echo", "x"]);
+    for _ in 0..20 {
+        assert_eq!(
+            raw_request(&broker.socket, &bad_magic, &[0, 1, 2]),
+            ERR_PROTO
+        );
+        assert_eq!(
+            raw_request(&broker.socket, &valid, &[0, 1, 2, 0, 1]),
+            ERR_FDS
+        );
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(open_fd_count(pid), before);
+}
+
+#[test]
+fn child_starts_with_default_signal_state() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\n\
+         /bin/sh -c #1\n",
+    );
+    let (code, stdout, _) = broker.call(&[
+        "/bin/sh",
+        "-c",
+        "exec grep -E '^Sig(Blk|Ign):' /proc/self/status",
+    ]);
+    assert_eq!(code, 0);
+    let field = |name: &str| -> u64 {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} missing in {stdout:?}"));
+        u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+    };
+    assert_eq!(field("SigBlk:"), 0, "child inherited a blocked signal mask");
+    let sigpipe_bit = 1u64 << (nix::libc::SIGPIPE - 1);
+    assert_eq!(
+        field("SigIgn:") & sigpipe_bit,
+        0,
+        "child inherited SIGPIPE ignored"
+    );
 }

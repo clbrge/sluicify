@@ -11,7 +11,17 @@ homepage = "https://github.com/clbrge/sluicify"
 readme = "README.md"
 keywords = ["sandbox", "ipc", "afunix", "audit", "broker"]
 categories = ["command-line-utilities", "os::linux-apis"]
-exclude = ["/node", "/.github", "/.gitignore"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/**",
+    "Cargo.toml",
+    "README.md",
+    "REFERENCE.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 # The crate is named after the verb (the user-facing client),
 # but src/main.rs is the daemon. Override the default-bin name.
