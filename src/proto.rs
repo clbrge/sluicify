@@ -17,7 +17,8 @@
 //!     u32  magic
 //!     u32  version
 //!     i32  status
-//!         status >= 0  → child exit code (0..=255)
+//!         status >= 0  → child exit code (0..=255); 128 + signo when
+//!                        the child was killed by a signal
 //!         status <  0  → sluice error (see ERR_* below)
 
 pub const MAGIC: u32 = 0x534C4358;
@@ -31,8 +32,9 @@ pub const ERR_NO_RULE: i32 = -1;
 pub const ERR_PROTO: i32 = -2;
 pub const ERR_FDS: i32 = -3; // wrong fd count
 pub const ERR_SPAWN: i32 = -4;
-pub const ERR_SIGNALED: i32 = -5; // child died from a signal
 pub const ERR_AUDIT: i32 = -6; // configured audit sink unwritable (strict)
+pub const ERR_TIMEOUT: i32 = -7; // rule timeout fired; child was killed
+pub const ERR_PEER: i32 = -8; // caller's SO_PEERCRED unreadable
 
 #[derive(Debug)]
 pub struct Request {
@@ -48,6 +50,7 @@ pub enum DecodeError {
     Truncated,
     BadUtf8,
     EmbeddedNul,
+    TrailingBytes,
 }
 
 pub fn decode_request(buf: &[u8]) -> Result<Request, DecodeError> {
@@ -78,6 +81,9 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, DecodeError> {
             .map_err(|_| DecodeError::BadUtf8)?
             .to_string();
         argv.push(s);
+    }
+    if p.pos != buf.len() {
+        return Err(DecodeError::TrailingBytes);
     }
     Ok(Request { argv })
 }
@@ -148,6 +154,16 @@ mod tests {
     fn truncated_rejected() {
         let buf = encode(&["x"]);
         assert!(decode_request(&buf[..buf.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn trailing_bytes_rejected() {
+        let mut buf = encode(&["x"]);
+        buf.push(0);
+        assert!(matches!(
+            decode_request(&buf),
+            Err(DecodeError::TrailingBytes)
+        ));
     }
 
     #[test]

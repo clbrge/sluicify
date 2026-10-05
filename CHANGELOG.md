@@ -21,8 +21,33 @@ breaking changes (and will be called out under **Changed** with a note).
   unaffected and composes naturally (`$HOME/log/c#$call.out`).
 - `sluice check` warns about slots without a regex.
 
+### Changed
+
+- **Wire protocol:** a child killed by a signal now reports `128 +
+  signo` instead of `ERR_SIGNALED` (-5, no longer sent). A fired rule
+  timeout reports the new `ERR_TIMEOUT` (-7); `sluicify` and the
+  example clients exit 124 for it.
+- `sluicify` client errors are now ssh-style one-liners. `sluice error
+  status -4` becomes `Failed to spawn <cmd> (exec error)`; `connect:
+  ENOENT` becomes `Broker not running: no socket at <path>`. Each
+  broker error code maps to a distinct message.
+- Manifest: start events carry `"resolved"` (the binary executed);
+  exit events carry `"signal"` and `"timed_out"` when set. An
+  executable that doesn't resolve is a `reject` (`exe_unresolved`)
+  instead of a start/exit pair.
+- Rule attribute values: a value starting with a quote is one quoted
+  word, so it can contain `;`; otherwise quotes are literal and `;`
+  starts a comment unless written `\;`.
+- `sluice serve` refuses to start when another broker is listening on
+  the socket path, instead of unlinking it.
+
 ### Fixed
 
+- Requests with trailing bytes or truncated by the receive buffer are
+  rejected.
+- `sluice check` reports the number of slots, not the number of slot
+  regexes.
+- `sluicify` reports a non-UTF-8 argument instead of panicking.
 - Slot regexes are anchored as `^(?:…)$`. Previously `a|b` became
   `^a|b$` (each branch anchored on one side only) and a trailing `\$`
   counted as an end anchor. **Behavior change:** values that only
@@ -43,20 +68,12 @@ breaking changes (and will be called out under **Changed** with a note).
 - A per-rule `logfile` is a parse error; it was accepted and ignored.
 - A panicking connection handler or a failed thread spawn no longer
   leaks a concurrency slot or takes down the accept loop.
-- A call whose peer credentials can't be read is refused (`ERR_PROTO`,
-  reject reason `peer_unknown`) instead of being logged as pid/uid 0.
+- A call whose peer credentials can't be read is refused with the new
+  `ERR_PEER` (-8), reject reason `peer_unknown`, instead of being
+  logged as pid/uid 0.
 - Spawned children start with an empty signal mask and default
   `SIGPIPE`; they previously inherited `SIGHUP` blocked and `SIGPIPE`
   ignored.
-
-### Changed
-
-- `sluicify` client errors are now ssh-style one-liners. `sluice error
-  status -4` becomes `Failed to spawn <cmd> (exec error)`; `connect:
-  ENOENT` becomes `Broker not running: no socket at <path>`. Each
-  protocol error code (`ERR_NO_RULE`, `ERR_PROTO`, `ERR_FDS`,
-  `ERR_SPAWN`, `ERR_SIGNALED`, `ERR_AUDIT`) maps to a distinct
-  message. Exit codes are unchanged.
 
 ## [0.1.0] - 2026-05-06
 

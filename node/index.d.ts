@@ -6,8 +6,10 @@
  * @param socketPath  Path to the sluice unix socket (e.g. "/run/sluice.sock").
  * @param argv        Command + arguments. argv[0] is the executable.
  * @returns Reply status:
- *   - 0..=255 → spawned child's exit code
- *   - <0      → sluice rejection (see proto.rs ERR_* constants)
+ *   - 0..=255 → spawned child's exit code (128 + signo if it was killed
+ *               by a signal)
+ *   - <0      → sluice rejection (see proto.rs ERR_* constants; -7 is
+ *               ERR_TIMEOUT, the rule's timeout fired)
  * @throws  When the broker is unreachable or the protocol fails.
  */
 export function call(socketPath: string, argv: string[]): number;

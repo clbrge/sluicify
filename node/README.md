@@ -30,7 +30,8 @@ The loader (`index.js`) finds either form automatically.
 const sluice = require('sluicify-native');
 
 const status = sluice.call('/run/agent.sock', ['echo', 'hello']);
-process.exit(status);
+// Negative = broker error (see index.d.ts); map like the sluicify binary.
+process.exit(status >= 0 ? status : status === -7 ? 124 : 128 - status);
 ```
 
 `call` is **synchronous** and blocks the calling JS thread until the

@@ -13,7 +13,9 @@
 //!     sluicify <socket> <cmd> [args...]
 //!
 //! Exit code:
-//!     n in 0..=255  — the spawned child's exit code
+//!     n in 0..=255  — the spawned child's exit code (128 + signo when
+//!                     it was killed by a signal)
+//!     124           — the rule's timeout fired (as GNU `timeout`)
 //!     128 + |status|  — sluice rejected (ERR_NO_RULE etc); see proto.rs
 
 use nix::sys::socket::{
@@ -21,10 +23,11 @@ use nix::sys::socket::{
     UnixAddr,
 };
 use sluicify::proto::{
-    ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PROTO, ERR_SIGNALED, ERR_SPAWN, MAGIC, VERSION,
+    ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PEER, ERR_PROTO, ERR_SPAWN, ERR_TIMEOUT, MAGIC, VERSION,
 };
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// Map a connect(2) failure to an ssh-style one-liner. ENOENT and
@@ -53,28 +56,47 @@ fn broker_error_message(status: i32, cmd: &str) -> String {
         ERR_PROTO => "Protocol error: broker rejected request framing".to_string(),
         ERR_FDS => "Protocol error: expected 3 file descriptors (stdin/stdout/stderr)".to_string(),
         ERR_SPAWN => format!("Failed to spawn {cmd} (exec error)"),
-        ERR_SIGNALED => format!("{cmd} terminated by signal"),
+        ERR_TIMEOUT => format!("{cmd} timed out (rule timeout) and was killed"),
+        ERR_PEER => "Broker refused: could not identify the caller (SO_PEERCRED)".to_string(),
         ERR_AUDIT => "Broker refused: audit sink unwritable (audit=strict)".to_string(),
         n => format!("Broker error (status {n})"),
     }
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: sluicify <socket> <cmd> [args...]");
+    const USAGE: &str = "usage: sluicify <socket> <cmd> [args...]";
+    let mut args = std::env::args_os().skip(1);
+    let Some(sock_path) = args.next().map(PathBuf::from) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let mut argv: Vec<String> = Vec::new();
+    for (i, a) in args.enumerate() {
+        match a.into_string() {
+            Ok(s) => argv.push(s),
+            Err(a) => {
+                eprintln!(
+                    "sluicify: Argument {} is not valid UTF-8: {}",
+                    i + 1,
+                    a.to_string_lossy()
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if argv.is_empty() {
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
-    let sock_path = &args[1];
-    let argv = &args[2..];
-    let cmd = argv.first().map(String::as_str).unwrap_or("(empty)");
+    let cmd = argv[0].as_str();
+    let sock_display = sock_path.display().to_string();
 
     // Encode request payload.
     let mut buf = Vec::with_capacity(64 + argv.iter().map(|s| s.len() + 4).sum::<usize>());
     buf.extend_from_slice(&MAGIC.to_le_bytes());
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&(argv.len() as u32).to_le_bytes());
-    for a in argv {
+    for a in &argv {
         let b = a.as_bytes();
         buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
         buf.extend_from_slice(b);
@@ -92,15 +114,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let addr = match UnixAddr::new(sock_path.as_str()) {
+    let addr = match UnixAddr::new(&sock_path) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("sluicify: Invalid socket path {sock_path}: {e}");
+            eprintln!("sluicify: Invalid socket path {sock_display}: {e}");
             return ExitCode::from(2);
         }
     };
     if let Err(e) = connect(sock.as_raw_fd(), &addr) {
-        eprintln!("sluicify: {}", connect_hint(&e, sock_path));
+        eprintln!("sluicify: {}", connect_hint(&e, &sock_display));
         return ExitCode::from(2);
     }
 
@@ -146,9 +168,12 @@ fn main() -> ExitCode {
     }
 
     if status >= 0 {
-        ExitCode::from(status.clamp(0, 255) as u8)
+        return ExitCode::from(status.clamp(0, 255) as u8);
+    }
+    eprintln!("sluicify: {}", broker_error_message(status, cmd));
+    if status == ERR_TIMEOUT {
+        ExitCode::from(124)
     } else {
-        eprintln!("sluicify: {}", broker_error_message(status, cmd));
         ExitCode::from((128u32 + (-status) as u32).min(255) as u8)
     }
 }

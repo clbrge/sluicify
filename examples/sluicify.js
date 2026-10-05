@@ -16,12 +16,14 @@ if (args.length < 2) {
   process.exit(2);
 }
 const [sockPath, ...argv] = args;
+const ERR_TIMEOUT = -7;
 
 let status;
 let usedNative = false;
 try {
   const sluice = require('../node');
-  status = sluice.call(sockPath, argv);
+  const raw = sluice.call(sockPath, argv);
+  status = raw >= 0 ? raw : raw === ERR_TIMEOUT ? 124 : Math.min(128 - raw, 255);
   usedNative = true;
 } catch (e) {
   if (e.code !== 'MODULE_NOT_FOUND' && !/no built addon/.test(e.message)) {

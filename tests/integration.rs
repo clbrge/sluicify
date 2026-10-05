@@ -165,7 +165,8 @@ fn timeout_kills_grandchild_in_process_group() {
     );
     let marker = broker.dir.join("gc.pid");
     let cmd = format!("sleep 30 & echo $! > {} ; wait", marker.display());
-    let _ = broker.call(&["/bin/sh", "-c", &cmd]);
+    let (code, _, stderr) = broker.call(&["/bin/sh", "-c", &cmd]);
+    assert_eq!(code, 124, "timeout exits 124; stderr: {stderr}");
     // After the call returns the timeout has fired and the broker has
     // started killing the group; give the kernel a moment.
     std::thread::sleep(Duration::from_millis(500));
@@ -354,4 +355,76 @@ fn tee_drain_is_cut_at_timeout_plus_grace() {
     let exit = wait_for_exit_event(&broker, Duration::from_secs(5));
     assert!(exit.contains("\"drain_timeout\":true"), "{exit}");
     assert!(exit.contains("\"stdout_bytes\":3"), "{exit}");
+}
+
+#[test]
+fn signal_death_exits_128_plus_signo() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
+         \x20\x20logfile = $DIR/manifest.jsonl\n\n\
+         /bin/sh -c #1\n",
+    );
+    let (code, _, _) = broker.call(&["/bin/sh", "-c", "kill -KILL $$"]);
+    assert_eq!(code, 137);
+    let exit = wait_for_exit_event(&broker, Duration::from_secs(2));
+    assert!(exit.contains("\"status\":137"), "{exit}");
+    assert!(exit.contains("\"signal\":9"), "{exit}");
+    assert!(!exit.contains("timed_out"), "{exit}");
+}
+
+#[test]
+fn timeout_is_recorded_in_manifest() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  env = PATH\n  exec_path = inherit\n\
+         \x20\x20logfile = $DIR/manifest.jsonl\n\n\
+         /bin/sh -c #1\n  timeout = 300ms\n",
+    );
+    let (code, _, _) = broker.call(&["/bin/sh", "-c", "exec sleep 30"]);
+    assert_eq!(code, 124);
+    let exit = wait_for_exit_event(&broker, Duration::from_secs(2));
+    assert!(exit.contains("\"timed_out\":true"), "{exit}");
+    assert!(exit.contains("\"signal\":15"), "{exit}");
+}
+
+#[test]
+fn start_event_records_resolved_binary() {
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  logfile = $DIR/manifest.jsonl\n\n\
+         echo #1\n  1 = ^[a-z]+$\n",
+    );
+    let (code, _, _) = broker.call(&["/tmp/anything/echo", "hi"]);
+    assert_eq!(code, 0);
+    let manifest = broker.manifest().expect("manifest");
+    let start = manifest
+        .lines()
+        .find(|l| l.contains("\"kind\":\"start\""))
+        .expect("start event");
+    assert!(
+        start.contains("\"argv\":[\"/tmp/anything/echo\""),
+        "{start}"
+    );
+    assert!(
+        start.contains("\"resolved\":\"/bin/echo\"")
+            || start.contains("\"resolved\":\"/usr/bin/echo\""),
+        "{start}"
+    );
+}
+
+#[test]
+fn second_broker_refuses_live_socket() {
+    let broker = Broker::start("defaults:\n  audit = best-effort\n\necho #1\n  1 = ^[a-z]+$\n");
+    let out = Command::new(SLUICE_BIN)
+        .arg("serve")
+        .arg("--rules")
+        .arg(broker.dir.join("rules"))
+        .arg("--socket")
+        .arg(&broker.socket)
+        .output()
+        .expect("run second sluice");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("another broker is listening"), "{stderr}");
+    let (code, stdout, _) = broker.call(&["echo", "alive"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "alive");
 }

@@ -27,8 +27,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Copy, Clone)]
 pub struct CallId(pub u64);
 
+pub struct StartEvent<'a> {
+    pub pid: i32,
+    pub line: usize,
+    pub argv: &'a [String],
+    /// The binary actually executed; argv[0] is only what the caller sent.
+    pub resolved: &'a Path,
+    pub stdout: Option<&'a Path>,
+    pub stderr: Option<&'a Path>,
+}
+
 pub struct ExitEvent {
+    /// Wire status sent to the caller.
     pub status: i32,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
     /// Until the direct child exited; output drain afterwards excluded.
     pub duration_ms: u64,
     pub stdout_bytes: u64,
@@ -72,25 +85,19 @@ impl Logger {
     /// strict audit, callers refuse to spawn the child when this is
     /// false — silently spawning past a failed start is exactly the
     /// audit-gap case strict mode exists to prevent.
-    pub fn start(
-        &self,
-        call: CallId,
-        pid: i32,
-        line: usize,
-        argv: &[String],
-        stdout_path: Option<&Path>,
-        stderr_path: Option<&Path>,
-    ) -> bool {
+    pub fn start(&self, call: CallId, e: &StartEvent) -> bool {
         let mut s = String::with_capacity(160);
         s.push('{');
         emit_meta(&mut s, call, "start");
-        write!(s, ",\"pid\":{pid},\"line\":{line},\"argv\":").unwrap();
-        emit_argv(&mut s, argv);
-        if let Some(p) = stdout_path {
+        write!(s, ",\"pid\":{},\"line\":{},\"argv\":", e.pid, e.line).unwrap();
+        emit_argv(&mut s, e.argv);
+        s.push_str(",\"resolved\":");
+        emit_path(&mut s, e.resolved);
+        if let Some(p) = e.stdout {
             s.push_str(",\"stdout\":");
             emit_path(&mut s, p);
         }
-        if let Some(p) = stderr_path {
+        if let Some(p) = e.stderr {
             s.push_str(",\"stderr\":");
             emit_path(&mut s, p);
         }
@@ -98,7 +105,8 @@ impl Logger {
         self.append_line(&s)
     }
 
-    /// `truncated` and `drain_timeout` are emitted only when set —
+    /// `signal`, `timed_out`, `truncated` and `drain_timeout` are
+    /// emitted only when set —
     /// common successful calls keep the line shorter and JSONL
     /// consumers can `select(.truncated)` to find audit gaps without a
     /// numeric comparison.
@@ -113,6 +121,12 @@ impl Logger {
             e.status, e.duration_ms, e.stdout_bytes, e.stderr_bytes
         )
         .unwrap();
+        if let Some(sig) = e.signal {
+            write!(s, ",\"signal\":{sig}").unwrap();
+        }
+        if e.timed_out {
+            s.push_str(",\"timed_out\":true");
+        }
         if e.truncated {
             s.push_str(",\"truncated\":true");
         }
@@ -311,11 +325,14 @@ mod tests {
         let stderr_p = PathBuf::from("/tmp/c1.err");
         logger.start(
             c,
-            1234,
-            5,
-            &["echo".into(), "hi".into()],
-            Some(&stdout_p),
-            Some(&stderr_p),
+            &StartEvent {
+                pid: 1234,
+                line: 5,
+                argv: &["echo".into(), "hi".into()],
+                resolved: Path::new("/usr/bin/echo"),
+                stdout: Some(&stdout_p),
+                stderr: Some(&stderr_p),
+            },
         );
         logger.exit(c, &exit_event(0, 6, false, false));
         drop(logger);
@@ -327,6 +344,7 @@ mod tests {
         assert!(lines[0].contains("\"kind\":\"start\""));
         assert!(lines[0].contains("\"stdout\":\"/tmp/c1.out\""));
         assert!(lines[0].contains("\"argv\":[\"echo\",\"hi\"]"));
+        assert!(lines[0].contains("\"resolved\":\"/usr/bin/echo\""));
         assert!(lines[1].contains("\"kind\":\"exit\""));
         assert!(lines[1].contains("\"status\":0"));
         assert!(lines[1].contains("\"stdout_bytes\":6"));
@@ -341,12 +359,37 @@ mod tests {
     ) -> ExitEvent {
         ExitEvent {
             status,
+            signal: None,
+            timed_out: false,
             duration_ms: 7,
             stdout_bytes,
             stderr_bytes: 0,
             truncated,
             drain_timeout,
         }
+    }
+
+    #[test]
+    fn exit_signal_and_timed_out_only_when_set() {
+        let p = temp_path();
+        let logger = Logger::open(&p).unwrap();
+        logger.exit(CallId(1), &exit_event(0, 0, false, false));
+        logger.exit(
+            CallId(2),
+            &ExitEvent {
+                signal: Some(9),
+                timed_out: true,
+                ..exit_event(crate::proto::ERR_TIMEOUT, 0, false, false)
+            },
+        );
+        drop(logger);
+        let s = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(!lines[0].contains("signal") && !lines[0].contains("timed_out"));
+        assert!(lines[1].contains("\"status\":-7"), "{}", lines[1]);
+        assert!(lines[1].contains("\"signal\":9"), "{}", lines[1]);
+        assert!(lines[1].contains("\"timed_out\":true"), "{}", lines[1]);
+        cleanup(&p);
     }
 
     #[test]

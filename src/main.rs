@@ -11,17 +11,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{SigSet, SigmaskHow, Signal};
 use nix::sys::socket::{
-    accept4, bind, listen, recvmsg, sendmsg, setsockopt, socket, sockopt, AddressFamily, Backlog,
-    ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
+    accept4, bind, connect, listen, recvmsg, sendmsg, setsockopt, socket, sockopt, AddressFamily,
+    Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use nix::sys::time::TimeVal;
-use sluicify::log::{open_raw, CallId, ExitEvent, Logger};
+use sluicify::log::{open_raw, CallId, ExitEvent, Logger, StartEvent};
 use sluicify::peer::peer_of;
 use sluicify::proto::{
-    decode_request, encode_reply, Request, ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PROTO, MAX_PAYLOAD,
+    decode_request, encode_reply, Request, ERR_AUDIT, ERR_FDS, ERR_NO_RULE, ERR_PEER, ERR_PROTO,
+    ERR_SPAWN, MAX_PAYLOAD,
 };
-use sluicify::rules::{self, AuditMode, LogPolicy, PathCtx, PathTemplate, Rules};
-use sluicify::spawn::{run_matched, Drain, Drained, SpawnCtx, SpawnOutcome, TeeSink};
+use sluicify::rules::{self, AuditMode, LogPolicy, PathCtx, PathTemplate, Rules, TokenPattern};
+use sluicify::spawn::{resolve_exe, run_matched, Drain, Drained, SpawnCtx, SpawnOutcome, TeeSink};
 
 #[derive(Parser)]
 #[command(name = "sluice", version, about = "AF_UNIX command broker")]
@@ -84,7 +85,10 @@ fn check(path: &Path) -> ExitCode {
             r.line_no,
             r.exe,
             r.tokens.len(),
-            r.slot_regex.len()
+            r.tokens
+                .iter()
+                .filter(|t| matches!(t, TokenPattern::Slot(_)))
+                .count()
         );
     }
     for r in &rules.rules {
@@ -194,10 +198,10 @@ fn serve(rules_path: &Path, sock_path: &Path) -> Result<(), String> {
         check_socket_parent(sock_path, snap.rules.defaults.audit)?;
     }
 
-    // Stale-socket cleanup
     if let Ok(meta) = std::fs::symlink_metadata(sock_path) {
         use std::os::unix::fs::FileTypeExt;
         if meta.file_type().is_socket() {
+            ensure_socket_stale(sock_path)?;
             std::fs::remove_file(sock_path)
                 .map_err(|e| format!("cannot remove stale socket: {e}"))?;
         } else {
@@ -301,6 +305,30 @@ impl ActiveSlot {
 impl Drop for ActiveSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A socket file nobody listens on refuses connections; anything else
+/// means a live broker (or an unknown state) we must not unlink.
+fn ensure_socket_stale(sock_path: &Path) -> Result<(), String> {
+    let probe = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .map_err(|e| format!("socket(): {e}"))?;
+    let addr = UnixAddr::new(sock_path).map_err(|e| format!("UnixAddr: {e}"))?;
+    match connect(probe.as_raw_fd(), &addr) {
+        Err(nix::errno::Errno::ECONNREFUSED) => Ok(()),
+        Ok(()) => Err(format!(
+            "another broker is listening at {} — refusing to take it over",
+            sock_path.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot tell whether {} is stale (connect: {e}) — refusing to remove it",
+            sock_path.display()
+        )),
     }
 }
 
@@ -531,21 +559,34 @@ fn dispatch(
     let log_argv = effective_log != LogPolicy::ExitOnly;
     let allow_tee = effective_log == LogPolicy::Full;
 
+    let refuse = |reason: &str, status: i32| {
+        if let Some(l) = manifest {
+            let argv: &[String] = if log_argv { &req.argv } else { &[] };
+            let call = CallId(call_counter.fetch_add(1, Ordering::SeqCst));
+            l.reject(call, reason, argv);
+        }
+        send_reply(conn, status);
+    };
+
     let peer = match peer_of(conn) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("sluice: refusing call: SO_PEERCRED failed: {e}");
-            if let Some(l) = manifest {
-                let argv: &[String] = if log_argv { &req.argv } else { &[] };
-                let call = CallId(call_counter.fetch_add(1, Ordering::SeqCst));
-                l.reject(call, "peer_unknown", argv);
-            }
-            send_reply(conn, ERR_PROTO);
-            return;
+            return refuse("peer_unknown", ERR_PEER);
         }
     };
     let peer_pid = peer.pid;
     let peer_uid = peer.uid;
+
+    // Resolved in the parent against the rule's exec_path, so `execve`
+    // gets an absolute path the caller's PATH can't redirect.
+    let Some(exe) = resolve_exe(rule, rules) else {
+        eprintln!(
+            "sluice: cannot resolve executable for rule at line {} (exec_path miss)",
+            rule.line_no
+        );
+        return refuse("exe_unresolved", ERR_SPAWN);
+    };
 
     // Resolve effective stdoutfile/stderrfile (rule overrides default).
     // We only consult them when the policy permits stdio tee — otherwise
@@ -641,11 +682,14 @@ fn dispatch(
         if log_argv {
             let ok = l.start(
                 call,
-                peer_pid,
-                rule.line_no,
-                &req.argv,
-                stdout_path.as_deref(),
-                stderr_path.as_deref(),
+                &StartEvent {
+                    pid: peer_pid,
+                    line: rule.line_no,
+                    argv: &req.argv,
+                    resolved: &exe,
+                    stdout: stdout_path.as_deref(),
+                    stderr: stderr_path.as_deref(),
+                },
             );
             if !ok && rules.defaults.audit == AuditMode::Strict {
                 eprintln!("sluice: refusing to execute (audit=strict): start write failed");
@@ -672,7 +716,12 @@ fn dispatch(
     } else {
         None
     };
-    let SpawnOutcome { status, drain } = run_matched(rule, rules, &req.argv, stdio, ctx);
+    let SpawnOutcome {
+        status,
+        signal,
+        timed_out,
+        drain,
+    } = run_matched(rule, rules, &req.argv, &exe, stdio, ctx);
     let dur_ms = started.elapsed().as_millis() as u64;
     send_reply(conn, status);
     let Drained {
@@ -701,6 +750,8 @@ fn dispatch(
             call,
             &ExitEvent {
                 status,
+                signal,
+                timed_out,
                 duration_ms: dur_ms,
                 stdout_bytes,
                 stderr_bytes,
@@ -727,6 +778,7 @@ fn recv_request(conn: &OwnedFd) -> Result<(Request, Option<[OwnedFd; 3]>), ()> {
     )
     .map_err(|_| ())?;
     let n = msg.bytes;
+    let truncated = msg.flags.contains(MsgFlags::MSG_TRUNC);
 
     let mut fds: Vec<OwnedFd> = Vec::new();
     for c in msg.cmsgs().map_err(|_| ())? {
@@ -738,6 +790,9 @@ fn recv_request(conn: &OwnedFd) -> Result<(Request, Option<[OwnedFd; 3]>), ()> {
         }
     }
 
+    if truncated {
+        return Err(());
+    }
     let req = decode_request(&buf[..n]).map_err(|_| ())?;
     let stdio = <[OwnedFd; 3]>::try_from(fds).ok();
     Ok((req, stdio))

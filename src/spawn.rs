@@ -12,7 +12,7 @@
 //!   and to what the file captures.
 
 use crate::log::CallId;
-use crate::proto::{ERR_SIGNALED, ERR_SPAWN};
+use crate::proto::{ERR_SPAWN, ERR_TIMEOUT};
 use crate::rules::{EnvPolicy, ExeMatch, ExecPath, Rule, Rules};
 use nix::fcntl::OFlag;
 use nix::libc;
@@ -21,10 +21,11 @@ use nix::sys::signal::{
 };
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, dup2, execve, fork, getpgid, pipe2, setpgid, ForkResult, Pid};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -39,9 +40,52 @@ pub struct TeeSink {
 #[derive(Default)]
 pub struct SpawnOutcome {
     pub status: i32,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
     /// Tee mode only: relays still draining output from descendants
     /// that outlive the direct child.
     pub drain: Option<Drain>,
+}
+
+impl SpawnOutcome {
+    fn spawn_failed() -> Self {
+        SpawnOutcome {
+            status: ERR_SPAWN,
+            ..Default::default()
+        }
+    }
+
+    fn from_wait(w: Waited, drain: Option<Drain>) -> Self {
+        let status = match (w.timed_out, w.reaped) {
+            (true, _) => ERR_TIMEOUT,
+            (false, Reaped::Exited(code)) => code,
+            (false, Reaped::Signaled(sig)) => 128 + sig,
+            (false, Reaped::WaitFailed) => ERR_SPAWN,
+        };
+        let signal = match w.reaped {
+            Reaped::Signaled(sig) => Some(sig),
+            _ => None,
+        };
+        SpawnOutcome {
+            status,
+            signal,
+            timed_out: w.timed_out,
+            drain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reaped {
+    Exited(i32),
+    Signaled(i32),
+    WaitFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Waited {
+    reaped: Reaped,
+    timed_out: bool,
 }
 
 pub struct Drain {
@@ -183,17 +227,18 @@ pub fn build_envp(rule: &Rule, rules: &Rules) -> Vec<(String, String)> {
     envp
 }
 
-/// Run a matched rule.
+/// Run a matched rule. `exe` comes from [`resolve_exe`].
 pub fn run_matched(
     rule: &Rule,
     rules: &Rules,
     caller_argv: &[String],
+    exe: &Path,
     stdio: [OwnedFd; 3],
     ctx: Option<SpawnCtx>,
 ) -> SpawnOutcome {
     let argv = build_argv(rule, caller_argv);
     let envp = build_envp(rule, rules);
-    let cwd = rule.cwd.as_ref().or(rules.defaults.cwd.as_ref()).cloned();
+    let cwd = rule.cwd.as_ref().or(rules.defaults.cwd.as_ref());
     let timeout = rule.timeout.or(rules.defaults.timeout);
 
     let argv_c: Vec<CString> = argv
@@ -201,69 +246,37 @@ pub fn run_matched(
         .filter_map(|s| CString::new(s.as_bytes()).ok())
         .collect();
     if argv_c.len() != argv.len() {
-        return SpawnOutcome {
-            status: ERR_SPAWN,
-            ..Default::default()
-        };
+        return SpawnOutcome::spawn_failed();
     }
     let envp_c: Vec<CString> = envp
         .iter()
         .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
         .collect();
-
-    // Resolve bare names against exec_path *now* (in the parent), so
-    // `execve` gets an absolute path and lookup can't be redirected
-    // through the caller's PATH.
-    let resolved = match resolve_exe(rule, rules) {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "sluice: cannot resolve executable for rule at line {} (exec_path miss)",
-                rule.line_no
-            );
-            return SpawnOutcome {
-                status: ERR_SPAWN,
-                ..Default::default()
-            };
-        }
+    let Ok(exe_c) = CString::new(exe.as_os_str().as_encoded_bytes()) else {
+        return SpawnOutcome::spawn_failed();
     };
-    let resolved_c = match CString::new(resolved.as_os_str().as_encoded_bytes()) {
-        Ok(c) => c,
-        Err(_) => {
-            return SpawnOutcome {
-                status: ERR_SPAWN,
-                ..Default::default()
-            }
-        }
+    // Converted here because the forked child must not allocate.
+    let Ok(cwd_c) = cwd
+        .map(|p| CString::new(p.as_os_str().as_encoded_bytes()))
+        .transpose()
+    else {
+        return SpawnOutcome::spawn_failed();
     };
-
-    let _ = Instant::now(); // start tracked in main
 
     let want_tee = matches!(&ctx, Some(c) if c.stdout_sink.is_some() || c.stderr_sink.is_some());
 
     if want_tee {
         run_with_tee(
             stdio,
-            &resolved_c,
+            &exe_c,
             &argv_c,
             &envp_c,
-            cwd.as_deref(),
+            cwd_c.as_deref(),
             timeout,
             ctx.unwrap(),
         )
     } else {
-        let status = run_direct(
-            stdio,
-            &resolved_c,
-            &argv_c,
-            &envp_c,
-            cwd.as_deref(),
-            timeout,
-        );
-        SpawnOutcome {
-            status,
-            ..Default::default()
-        }
+        run_direct(stdio, &exe_c, &argv_c, &envp_c, cwd_c.as_deref(), timeout)
     }
 }
 
@@ -272,16 +285,16 @@ fn run_direct(
     resolved_c: &CString,
     argv_c: &[CString],
     envp_c: &[CString],
-    cwd: Option<&std::path::Path>,
+    cwd: Option<&CStr>,
     timeout: Option<Duration>,
-) -> i32 {
+) -> SpawnOutcome {
     let raw: [RawFd; 3] = [
         stdio[0].as_raw_fd(),
         stdio[1].as_raw_fd(),
         stdio[2].as_raw_fd(),
     ];
     match unsafe { fork() } {
-        Err(_) => ERR_SPAWN,
+        Err(_) => SpawnOutcome::spawn_failed(),
         Ok(ForkResult::Child) => {
             reset_child_signals();
             // Become own process-group leader. Both parent and child
@@ -303,7 +316,7 @@ fn run_direct(
         }
         Ok(ForkResult::Parent { child }) => {
             let _ = setpgid(child, child);
-            wait_child_with_timeout(child, timeout)
+            SpawnOutcome::from_wait(wait_child_with_timeout(child, timeout), None)
         }
     }
 }
@@ -313,7 +326,7 @@ fn run_with_tee(
     resolved_c: &CString,
     argv_c: &[CString],
     envp_c: &[CString],
-    cwd: Option<&std::path::Path>,
+    cwd: Option<&CStr>,
     timeout: Option<Duration>,
     ctx: SpawnCtx,
 ) -> SpawnOutcome {
@@ -321,21 +334,11 @@ fn run_with_tee(
 
     let (pout_r, pout_w) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(p) => p,
-        Err(_) => {
-            return SpawnOutcome {
-                status: ERR_SPAWN,
-                ..Default::default()
-            }
-        }
+        Err(_) => return SpawnOutcome::spawn_failed(),
     };
     let (perr_r, perr_w) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(p) => p,
-        Err(_) => {
-            return SpawnOutcome {
-                status: ERR_SPAWN,
-                ..Default::default()
-            }
-        }
+        Err(_) => return SpawnOutcome::spawn_failed(),
     };
 
     let drain_deadline = timeout.map(|t| Instant::now() + t + KILL_GRACE);
@@ -344,10 +347,7 @@ fn run_with_tee(
     let perr_w_raw = perr_w.as_raw_fd();
 
     match unsafe { fork() } {
-        Err(_) => SpawnOutcome {
-            status: ERR_SPAWN,
-            ..Default::default()
-        },
+        Err(_) => SpawnOutcome::spawn_failed(),
         Ok(ForkResult::Child) => {
             reset_child_signals();
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
@@ -384,17 +384,14 @@ fn run_with_tee(
                 r
             });
 
-            let status = wait_child_with_timeout(child, timeout);
+            let waited = wait_child_with_timeout(child, timeout);
             let drain = Drain {
                 stdout,
                 stderr,
                 done,
             };
             drain.settle(REPLY_SETTLE);
-            SpawnOutcome {
-                status,
-                drain: Some(drain),
-            }
+            SpawnOutcome::from_wait(waited, Some(drain))
         }
     }
 }
@@ -469,26 +466,26 @@ fn reset_child_signals() {
     let _ = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
 }
 
-fn wait_child(pid: Pid) -> i32 {
+fn wait_child(pid: Pid) -> Reaped {
     loop {
         match waitpid(pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return code.clamp(0, 255),
-            Ok(WaitStatus::Signaled(_, _, _)) => return ERR_SIGNALED,
+            Ok(WaitStatus::Exited(_, code)) => return Reaped::Exited(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Reaped::Signaled(sig as i32),
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return ERR_SPAWN,
+            Err(_) => return Reaped::WaitFailed,
         }
     }
 }
 
 /// Reaps `pid` if it exits before `limit`; `None` means still running.
-fn reap_by(pid: Pid, limit: Instant) -> Option<i32> {
+fn reap_by(pid: Pid, limit: Instant) -> Option<Reaped> {
     loop {
         match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => return Some(code.clamp(0, 255)),
-            Ok(WaitStatus::Signaled(_, _, _)) => return Some(ERR_SIGNALED),
+            Ok(WaitStatus::Exited(_, code)) => return Some(Reaped::Exited(code)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Some(Reaped::Signaled(sig as i32)),
             Ok(_) | Err(nix::errno::Errno::EINTR) => {}
-            Err(_) => return Some(ERR_SPAWN),
+            Err(_) => return Some(Reaped::WaitFailed),
         }
         if Instant::now() >= limit {
             return None;
@@ -499,16 +496,22 @@ fn reap_by(pid: Pid, limit: Instant) -> Option<i32> {
 
 /// Timeout enforcement without a pidfd, for when `pidfd_open` or `poll`
 /// fails (e.g. EMFILE).
-fn wait_child_polling(pid: Pid, deadline: Instant) -> i32 {
-    if let Some(status) = reap_by(pid, deadline) {
-        return status;
+fn wait_child_polling(pid: Pid, deadline: Instant) -> Waited {
+    if let Some(reaped) = reap_by(pid, deadline) {
+        return Waited {
+            reaped,
+            timed_out: false,
+        };
     }
     let _ = kill_tree(pid, Signal::SIGTERM, None);
-    if let Some(status) = reap_by(pid, Instant::now() + KILL_GRACE) {
-        return status;
+    let reaped = reap_by(pid, Instant::now() + KILL_GRACE).unwrap_or_else(|| {
+        let _ = kill_tree(pid, Signal::SIGKILL, None);
+        wait_child(pid)
+    });
+    Waited {
+        reaped,
+        timed_out: true,
     }
-    let _ = kill_tree(pid, Signal::SIGKILL, None);
-    wait_child(pid)
 }
 
 fn ms_until(deadline: Instant) -> i32 {
@@ -526,9 +529,14 @@ fn ms_until(deadline: Instant) -> i32 {
 /// `setpgid` failure can't cause the broker to signal its own group.
 /// In that fallback we send to the direct child only via pidfd — at
 /// worst the grandchildren leak (same as pre-fix behavior).
-fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> i32 {
+fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> Waited {
     let deadline = match timeout {
-        None => return wait_child(pid),
+        None => {
+            return Waited {
+                reaped: wait_child(pid),
+                timed_out: false,
+            }
+        }
         Some(d) => Instant::now() + d,
     };
 
@@ -540,7 +548,7 @@ fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> i32 {
         }
     };
 
-    match poll_readable(&pidfd, ms_until(deadline)) {
+    let timed_out = match poll_readable(&pidfd, ms_until(deadline)) {
         0 => {
             // Timeout fired. Signal the whole process group, then a brief
             // grace period, then SIGKILL the group.
@@ -548,15 +556,19 @@ fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> i32 {
             if poll_readable(&pidfd, KILL_GRACE.as_millis() as i32) <= 0 {
                 let _ = kill_tree(pid, Signal::SIGKILL, Some(&pidfd));
             }
+            true
         }
         r if r < 0 => {
             eprintln!("sluice: poll on pidfd failed; enforcing timeout by polling");
             return wait_child_polling(pid, deadline);
         }
-        _ => {}
-    }
+        _ => false,
+    };
     drop(pidfd);
-    wait_child(pid)
+    Waited {
+        reaped: wait_child(pid),
+        timed_out,
+    }
 }
 
 /// Send `sig` to `child`'s process group if `child` is the group leader
@@ -627,11 +639,6 @@ fn poll_readable(fd: &OwnedFd, timeout_ms: i32) -> i32 {
         return r;
     }
 }
-
-// Quiet the now-unused-via-removed-path `kill` import warning while
-// keeping it available for the pidfd-open-failure fallback above.
-#[allow(unused_imports)]
-use nix::sys::signal::kill as _kill_alias;
 
 #[cfg(test)]
 mod tests {
@@ -733,8 +740,14 @@ mod tests {
     #[test]
     fn polling_wait_returns_exit_code_before_deadline() {
         let (mut child, pid) = spawn_in_own_group("exit 3");
-        let status = wait_child_polling(pid, Instant::now() + Duration::from_secs(5));
-        assert_eq!(status, 3);
+        let waited = wait_child_polling(pid, Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            waited,
+            Waited {
+                reaped: Reaped::Exited(3),
+                timed_out: false
+            }
+        );
         let _ = child.wait();
     }
 
@@ -742,8 +755,14 @@ mod tests {
     fn polling_wait_kills_at_deadline() {
         let (mut child, pid) = spawn_in_own_group("exec sleep 30");
         let started = Instant::now();
-        let status = wait_child_polling(pid, started + Duration::from_millis(200));
-        assert_eq!(status, ERR_SIGNALED);
+        let waited = wait_child_polling(pid, started + Duration::from_millis(200));
+        assert_eq!(
+            waited,
+            Waited {
+                reaped: Reaped::Signaled(nix::libc::SIGTERM),
+                timed_out: true
+            }
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "{:?}",

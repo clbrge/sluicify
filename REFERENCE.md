@@ -22,8 +22,14 @@ Complete syntax and semantics. For an introduction and tutorial, see
 
 Line-oriented, whitespace-significant.
 
-- `;` starts a comment to end of line. Quote-aware: a `;` inside a
-  single- or double-quoted literal is data, not a comment.
+- `;` starts a comment to end of line. On rule lines it is
+  quote-aware: a `;` inside a single- or double-quoted literal is data,
+  not a comment.
+- Attribute values: if the value starts with `'` or `"`, it is one
+  shell-quoted word (so `1 = '^a;b$'` keeps the `;`; prefer single
+  quotes for regexes, since a backslash inside `"…"` escapes the next
+  character). Otherwise quotes are ordinary characters, and `;` starts a
+  comment unless written `\;`.
 - Blank lines separate stanzas; otherwise meaningless.
 - An **unindented** line is a stanza header — either the literal
   `defaults:` or a *rule line*.
@@ -94,8 +100,10 @@ timeout = 5m
 timeout = 250ms
 ```
 
-When the timeout fires, the wire reply is `ERR_SIGNALED` (-5) and the
-manifest exit event records the elapsed time.
+When the timeout fires, the wire reply is `ERR_TIMEOUT` (-7), whatever
+the child's own exit, and `sluicify` exits 124 (as GNU `timeout`). The
+manifest exit event records `"timed_out":true`, the elapsed time, and
+the killing signal.
 
 The timeout also bounds output capture under `stdoutfile`/`stderrfile`:
 relays stop at timeout + 2 s even if a background process still holds
@@ -333,6 +341,13 @@ when at least one sink lost bytes during the call:
 Find them with `jq 'select(.truncated)'`. The field is omitted on
 clean calls to keep common-case lines shorter.
 
+The start event's `"resolved"` is the binary actually executed, after
+[`exec_path`](#exec_path) lookup; `argv[0]` is only what the caller
+sent. The exit event's `status` is the wire status; it adds
+`"signal":N` when the child was killed by a signal and
+`"timed_out":true` when the rule's timeout fired (both omitted
+otherwise).
+
 `duration_ms` measures the direct child. When output capture was cut at
 the rule's timeout + 2 s while a background process still held the
 pipe, the exit event carries `"drain_timeout":true` (also omitted when
@@ -448,16 +463,20 @@ Status interpretation:
 
 | value                  | meaning                                                 |
 |------------------------|---------------------------------------------------------|
-| `0..=255`              | child's exit code (clamped)                             |
+| `0..=255`              | child's exit code; `128 + signo` if killed by a signal  |
 | `-1` (`ERR_NO_RULE`)   | no rule matched (or regex rejected slot)                |
 | `-2` (`ERR_PROTO`)     | protocol error or recv timeout                          |
 | `-3` (`ERR_FDS`)       | wrong fd count (≠ 3 attached)                           |
 | `-4` (`ERR_SPAWN`)     | fork/exec failed                                        |
-| `-5` (`ERR_SIGNALED`)  | child died from a signal (incl. timeout SIGKILL)        |
 | `-6` (`ERR_AUDIT`)     | audit refused under strict mode                         |
+| `-7` (`ERR_TIMEOUT`)   | rule `timeout` fired; child was killed                  |
+| `-8` (`ERR_PEER`)      | caller's `SO_PEERCRED` unreadable                       |
 
-The bundled clients (`sluicify`, `sluicify.py`) translate negative
-status to exit `128 + |status|` so shell pipelines can branch on it.
+`-5` is no longer sent; signal deaths are `128 + signo`.
+
+The bundled clients (`sluicify`, `sluicify.py`, `sluicify.js`) exit
+124 on `ERR_TIMEOUT` and `128 + |status|` on other negative statuses,
+so shell pipelines can branch on them.
 
 ### See also
 
@@ -500,8 +519,9 @@ The broker:
 
 - Refuses to start if the socket parent dir is writable by another uid
   (under strict; warns under best-effort).
-- Removes a stale socket *file*, but refuses to overwrite a non-socket
-  at the path.
+- Removes a stale socket *file* (one that refuses connections), but
+  refuses to start if another broker is listening there or if the path
+  is not a socket.
 - Binds with `umask 0077` so the socket file is mode 0600.
 - `SIGHUP` → reload rules + reopen manifest + clear sink cache.
 - Exits with code 2 on configuration error, runs forever otherwise.
@@ -572,13 +592,14 @@ follow the convention `128 + |sluice_error|`:
 | broker status | sluicify exit code | meaning                       |
 |---------------|--------------------|-------------------------------|
 | `0`           | `0`                | child exited 0                |
-| `1..=255`     | `1..=255`          | child's exit code             |
+| `1..=255`     | `1..=255`          | child's exit code (`128 + signo` if killed by a signal) |
 | `-1`          | `129`              | no matching rule              |
 | `-2`          | `130`              | protocol error / recv timeout |
 | `-3`          | `131`              | wrong fd count                |
 | `-4`          | `132`              | spawn failure                 |
-| `-5`          | `133`              | child died from signal        |
 | `-6`          | `134`              | audit refused (strict)        |
+| `-7`          | `124`              | rule timeout fired            |
+| `-8`          | `136`              | caller identity unreadable    |
 
 ---
 

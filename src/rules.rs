@@ -233,24 +233,24 @@ pub fn parse(input: &str) -> Result<Rules, ParseError> {
 
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
+        if raw.starts_with([' ', '\t']) {
+            if let Some((key, val)) = split_attr(raw, line_no)? {
+                apply_attr(&mut current, &mut defaults, &mut rules, key, &val, line_no)?;
+            }
+            continue;
+        }
         let stripped = strip_comment(raw);
         if stripped.trim().is_empty() {
             continue;
         }
-        let indented = stripped.starts_with([' ', '\t']);
-        if indented {
-            let (key, val) = split_attr(stripped, line_no)?;
-            apply_attr(&mut current, &mut defaults, &mut rules, key, val, line_no)?;
+        // New stanza
+        let trimmed = stripped.trim_end();
+        if trimmed == "defaults:" {
+            current = Stanza::Defaults;
         } else {
-            // New stanza
-            let trimmed = stripped.trim_end();
-            if trimmed == "defaults:" {
-                current = Stanza::Defaults;
-            } else {
-                let rule = parse_rule_line(trimmed, line_no)?;
-                rules.push(rule);
-                current = Stanza::Rule(rules.len() - 1);
-            }
+            let rule = parse_rule_line(trimmed, line_no)?;
+            rules.push(rule);
+            current = Stanza::Rule(rules.len() - 1);
         }
     }
 
@@ -301,21 +301,62 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn split_attr(line: &str, line_no: usize) -> Result<(&str, &str), ParseError> {
-    let trimmed = line.trim();
-    let eq = trimmed.find('=').ok_or_else(|| ParseError {
-        line_no,
-        message: format!("attribute line missing '=': {trimmed:?}"),
-    })?;
-    let key = trimmed[..eq].trim();
-    let val = trimmed[eq + 1..].trim();
+/// `None` for a blank or comment-only line.
+fn split_attr(line: &str, line_no: usize) -> Result<Option<(&str, String)>, ParseError> {
+    let body = line.trim_start();
+    if body.is_empty() || body.starts_with(';') {
+        return Ok(None);
+    }
+    let eq = match body.find(['=', ';']) {
+        Some(i) if body.as_bytes()[i] == b'=' => i,
+        _ => {
+            return Err(ParseError {
+                line_no,
+                message: format!(
+                    "attribute line missing '=': {:?}",
+                    strip_unquoted_comment(body).trim_end()
+                ),
+            })
+        }
+    };
+    let key = body[..eq].trim();
     if key.is_empty() {
         return Err(ParseError {
             line_no,
             message: "empty attribute key".into(),
         });
     }
-    Ok((key, val))
+    let val = attr_value(body[eq + 1..].trim_start(), line_no)?;
+    Ok(Some((key, val)))
+}
+
+/// A value starting with a quote is one shell-quoted word, so it can
+/// contain `;`. Otherwise quotes are literal and `;` starts a comment
+/// unless escaped as `\;`.
+fn attr_value(rest: &str, line_no: usize) -> Result<String, ParseError> {
+    if !rest.starts_with(['\'', '"']) {
+        return Ok(strip_unquoted_comment(rest).trim_end().to_string());
+    }
+    match tokenize(strip_comment(rest).trim_end(), line_no)?.as_slice() {
+        [v] => Ok(v.clone()),
+        _ => Err(ParseError {
+            line_no,
+            message: "quoted attribute value must be a single quoted string".into(),
+        }),
+    }
+}
+
+fn strip_unquoted_comment(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b';' => return &s[..i],
+            _ => i += 1,
+        }
+    }
+    s
 }
 
 fn apply_attr(
@@ -962,6 +1003,44 @@ mod tests {
     fn per_rule_logfile_rejected() {
         let err = parse("git log\n  logfile = /var/log/sluice/m.jsonl\n").unwrap_err();
         assert!(err.message.contains("defaults-only"), "{}", err.message);
+    }
+
+    #[test]
+    fn quoted_regex_may_contain_semicolon() {
+        let r = parse("echo #1\n  1 = '^a;b$'   ; comment\n").unwrap();
+        let m = |v: &str| r.match_argv(&["echo".into(), v.into()]).is_some();
+        assert!(m("a;b"));
+        assert!(!m("a"));
+    }
+
+    #[test]
+    fn unquoted_value_quote_does_not_swallow_comment() {
+        let r = parse("echo #1\n  1 = ^[^']+$   ; no quotes\n").unwrap();
+        let m = |v: &str| r.match_argv(&["echo".into(), v.into()]).is_some();
+        assert!(m("abc"));
+        assert!(!m("a'c"));
+    }
+
+    #[test]
+    fn escaped_semicolon_in_unquoted_value() {
+        let r = parse("echo #1\n  1 = ^a\\;b$ ; comment\n").unwrap();
+        assert!(r.match_argv(&["echo".into(), "a;b".into()]).is_some());
+    }
+
+    #[test]
+    fn quoted_value_with_trailing_word_rejected() {
+        let err = parse("echo #1\n  1 = '^a$' b\n").unwrap_err();
+        assert!(
+            err.message.contains("single quoted string"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn attribute_missing_equals_before_comment_rejected() {
+        let err = parse("echo\n  timeout ; = 5s\n").unwrap_err();
+        assert!(err.message.contains("missing '='"), "{}", err.message);
     }
 
     #[test]

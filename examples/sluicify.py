@@ -15,6 +15,7 @@ import sys
 
 MAGIC   = 0x534C4358
 VERSION = 1
+ERR_TIMEOUT = -7
 
 
 def call(sock_path, argv):
@@ -39,7 +40,9 @@ def call(sock_path, argv):
     magic, version, status = struct.unpack("<IIi", reply[:12])
     if magic != MAGIC or version != VERSION:
         sys.exit(f"sluice: bad reply magic/version: {magic:#x}/{version}")
-    sys.exit(status if status >= 0 else 128 - status)
+    if status >= 0:
+        sys.exit(status)
+    sys.exit(124 if status == ERR_TIMEOUT else min(128 - status, 255))
 
 
 if __name__ == "__main__":
