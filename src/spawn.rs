@@ -19,7 +19,7 @@ use nix::libc;
 use nix::sys::signal::{
     kill, killpg, pthread_sigmask, signal, SigHandler, SigSet, SigmaskHow, Signal,
 };
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, dup2, execve, fork, getpgid, pipe2, setpgid, ForkResult, Pid};
 use std::ffi::CString;
 use std::fs::File;
@@ -99,6 +99,7 @@ struct Relayed {
 }
 
 const KILL_GRACE: Duration = Duration::from_secs(2);
+const REAP_POLL_TICK: Duration = Duration::from_millis(10);
 
 /// Upper bound on how long the reply waits for the relays to reach EOF
 /// after the direct child exits. Without background holders EOF is
@@ -407,11 +408,7 @@ fn relay(src: OwnedFd, dst: OwnedFd, sink: Option<TeeSink>, deadline: Option<Ins
     let mut out = Relayed::default();
     loop {
         if let Some(d) = deadline {
-            let left_ms = d
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .min(i32::MAX as u128) as i32;
-            match poll_readable(&src, left_ms) {
+            match poll_readable(&src, ms_until(d)) {
                 0 => {
                     out.cut = true;
                     break;
@@ -484,6 +481,43 @@ fn wait_child(pid: Pid) -> i32 {
     }
 }
 
+/// Reaps `pid` if it exits before `limit`; `None` means still running.
+fn reap_by(pid: Pid, limit: Instant) -> Option<i32> {
+    loop {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => return Some(code.clamp(0, 255)),
+            Ok(WaitStatus::Signaled(_, _, _)) => return Some(ERR_SIGNALED),
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(_) => return Some(ERR_SPAWN),
+        }
+        if Instant::now() >= limit {
+            return None;
+        }
+        std::thread::sleep(REAP_POLL_TICK);
+    }
+}
+
+/// Timeout enforcement without a pidfd, for when `pidfd_open` or `poll`
+/// fails (e.g. EMFILE).
+fn wait_child_polling(pid: Pid, deadline: Instant) -> i32 {
+    if let Some(status) = reap_by(pid, deadline) {
+        return status;
+    }
+    let _ = kill_tree(pid, Signal::SIGTERM, None);
+    if let Some(status) = reap_by(pid, Instant::now() + KILL_GRACE) {
+        return status;
+    }
+    let _ = kill_tree(pid, Signal::SIGKILL, None);
+    wait_child(pid)
+}
+
+fn ms_until(deadline: Instant) -> i32 {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .min(i32::MAX as u128) as i32
+}
+
 /// Race-free wait+timeout via `pidfd_open` + `poll`. Signals are sent
 /// to the child's *process group* via `killpg` so grandchildren that
 /// inherit the group are caught (e.g. `sh -c 'helper & wait'`).
@@ -492,31 +526,34 @@ fn wait_child(pid: Pid) -> i32 {
 /// `setpgid` failure can't cause the broker to signal its own group.
 /// In that fallback we send to the direct child only via pidfd — at
 /// worst the grandchildren leak (same as pre-fix behavior).
-///
-/// Falls back to a plain `wait_child` (no timeout) if `pidfd_open`
-/// isn't supported (Linux < 5.3 — basically nothing in 2026).
 fn wait_child_with_timeout(pid: Pid, timeout: Option<Duration>) -> i32 {
-    let timeout = match timeout {
+    let deadline = match timeout {
         None => return wait_child(pid),
-        Some(d) => d,
+        Some(d) => Instant::now() + d,
     };
 
     let pidfd = match pidfd_open(pid) {
         Ok(fd) => fd,
-        Err(_) => {
-            let _ = kill_tree(pid, Signal::SIGTERM, None);
-            return wait_child(pid);
+        Err(e) => {
+            eprintln!("sluice: pidfd_open failed ({e}); enforcing timeout by polling");
+            return wait_child_polling(pid, deadline);
         }
     };
 
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    if poll_readable(&pidfd, timeout_ms) == 0 {
-        // Timeout fired. Signal the whole process group, then a brief
-        // grace period, then SIGKILL the group.
-        let _ = kill_tree(pid, Signal::SIGTERM, Some(&pidfd));
-        if poll_readable(&pidfd, KILL_GRACE.as_millis() as i32) == 0 {
-            let _ = kill_tree(pid, Signal::SIGKILL, Some(&pidfd));
+    match poll_readable(&pidfd, ms_until(deadline)) {
+        0 => {
+            // Timeout fired. Signal the whole process group, then a brief
+            // grace period, then SIGKILL the group.
+            let _ = kill_tree(pid, Signal::SIGTERM, Some(&pidfd));
+            if poll_readable(&pidfd, KILL_GRACE.as_millis() as i32) <= 0 {
+                let _ = kill_tree(pid, Signal::SIGKILL, Some(&pidfd));
+            }
         }
+        r if r < 0 => {
+            eprintln!("sluice: poll on pidfd failed; enforcing timeout by polling");
+            return wait_child_polling(pid, deadline);
+        }
+        _ => {}
     }
     drop(pidfd);
     wait_child(pid)
@@ -680,6 +717,39 @@ mod tests {
         let caller = vec!["git".into(), "log".into(), "-n".into(), "5".into()];
         let argv = build_argv(&r.rules[0], &caller);
         assert_eq!(argv, vec!["git", "log", "-n", "5"]);
+    }
+
+    fn spawn_in_own_group(script: &str) -> (std::process::Child, Pid) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        (child, pid)
+    }
+
+    #[test]
+    fn polling_wait_returns_exit_code_before_deadline() {
+        let (mut child, pid) = spawn_in_own_group("exit 3");
+        let status = wait_child_polling(pid, Instant::now() + Duration::from_secs(5));
+        assert_eq!(status, 3);
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn polling_wait_kills_at_deadline() {
+        let (mut child, pid) = spawn_in_own_group("exec sleep 30");
+        let started = Instant::now();
+        let status = wait_child_polling(pid, started + Duration::from_millis(200));
+        assert_eq!(status, ERR_SIGNALED);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = child.wait();
     }
 
     use std::path::PathBuf;

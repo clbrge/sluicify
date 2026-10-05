@@ -263,24 +263,44 @@ fn serve(rules_path: &Path, sock_path: &Path) -> Result<(), String> {
         let tv = TimeVal::new(RECV_TIMEOUT_SECS, 0);
         let _ = setsockopt(&conn, sockopt::ReceiveTimeout, &tv);
 
-        let n = active.fetch_add(1, Ordering::SeqCst);
-        if n >= MAX_ACTIVE {
-            active.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = ActiveSlot::acquire(&active) else {
             eprintln!("sluice: at cap ({MAX_ACTIVE}), rejecting connection");
             drop(conn);
             continue;
-        }
+        };
 
         // Snapshot the current LiveState. In-flight calls keep their
         // snapshot across a SIGHUP; new calls see the fresh state.
         let snap = state.lock().unwrap().clone();
         let sk = Arc::clone(&sinks);
-        let a = Arc::clone(&active);
         let cc = Arc::clone(&call_counter);
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let _slot = slot;
             handle_conn(conn, snap, sk, cc);
-            a.fetch_sub(1, Ordering::SeqCst);
         });
+        if let Err(e) = spawned {
+            eprintln!("sluice: cannot spawn connection thread: {e}");
+        }
+    }
+}
+
+/// Held for the life of a connection thread; released on drop, so a
+/// panicking handler or a failed thread spawn still frees the slot.
+struct ActiveSlot(Arc<AtomicUsize>);
+
+impl ActiveSlot {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE {
+            active.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(ActiveSlot(Arc::clone(active)))
+    }
+}
+
+impl Drop for ActiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -500,9 +520,6 @@ fn dispatch(
 ) {
     let rules: &Rules = &snap.rules;
     let manifest = &snap.manifest;
-    let peer = peer_of(conn);
-    let peer_pid = peer.map(|p| p.pid).unwrap_or(0);
-    let peer_uid = peer.map(|p| p.uid).unwrap_or(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -513,6 +530,22 @@ fn dispatch(
     let effective_log = rule.log.unwrap_or(rules.defaults.log);
     let log_argv = effective_log != LogPolicy::ExitOnly;
     let allow_tee = effective_log == LogPolicy::Full;
+
+    let peer = match peer_of(conn) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sluice: refusing call: SO_PEERCRED failed: {e}");
+            if let Some(l) = manifest {
+                let argv: &[String] = if log_argv { &req.argv } else { &[] };
+                let call = CallId(call_counter.fetch_add(1, Ordering::SeqCst));
+                l.reject(call, "peer_unknown", argv);
+            }
+            send_reply(conn, ERR_PROTO);
+            return;
+        }
+    };
+    let peer_pid = peer.pid;
+    let peer_uid = peer.uid;
 
     // Resolve effective stdoutfile/stderrfile (rule overrides default).
     // We only consult them when the policy permits stdio tee — otherwise

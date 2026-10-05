@@ -189,7 +189,6 @@ pub struct Rule {
     pub cwd: Option<PathBuf>,
     pub env: Option<EnvPolicy>,
     pub log: Option<LogPolicy>,
-    pub logfile: Option<PathTemplate>,
     pub stdoutfile: Option<PathTemplate>,
     pub stderrfile: Option<PathTemplate>,
     pub exec_path: Option<ExecPath>,
@@ -522,8 +521,12 @@ fn apply_rule_attr(r: &mut Rule, key: &str, val: &str, line_no: usize) -> Result
             return Ok(());
         }
         "logfile" => {
-            r.logfile = Some(parse_path_template(val, line_no)?);
-            return Ok(());
+            return Err(ParseError {
+                line_no,
+                message: "logfile is defaults-only (one manifest per broker); \
+                          move it under `defaults:`"
+                    .into(),
+            });
         }
         "stdoutfile" => {
             r.stdoutfile = Some(parse_path_template(val, line_no)?);
@@ -709,7 +712,6 @@ fn parse_rule_line(line: &str, line_no: usize) -> Result<Rule, ParseError> {
         cwd: None,
         env: None,
         log: None,
-        logfile: None,
         stdoutfile: None,
         stderrfile: None,
         exec_path: None,
@@ -954,6 +956,12 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(free, vec!["#dst", "#3"]);
+    }
+
+    #[test]
+    fn per_rule_logfile_rejected() {
+        let err = parse("git log\n  logfile = /var/log/sluice/m.jsonl\n").unwrap_err();
+        assert!(err.message.contains("defaults-only"), "{}", err.message);
     }
 
     #[test]

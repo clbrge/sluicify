@@ -37,6 +37,14 @@ breaking changes (and will be called out under **Changed** with a note).
   when the child exits, as in direct mode. Capture continues until they
   close the pipe or until the rule's timeout + 2 s, and the exit event
   is written then (`"drain_timeout":true` when cut).
+- A `timeout` is still enforced when `pidfd_open` or `poll` fails
+  (e.g. EMFILE); the child was previously sent `SIGTERM` immediately,
+  or never killed on a `poll` error.
+- A per-rule `logfile` is a parse error; it was accepted and ignored.
+- A panicking connection handler or a failed thread spawn no longer
+  leaks a concurrency slot or takes down the accept loop.
+- A call whose peer credentials can't be read is refused (`ERR_PROTO`,
+  reject reason `peer_unknown`) instead of being logged as pid/uid 0.
 - Spawned children start with an empty signal mask and default
   `SIGPIPE`; they previously inherited `SIGHUP` blocked and `SIGPIPE`
   ignored.

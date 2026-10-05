@@ -14,9 +14,9 @@ pub struct PeerInfo {
     pub gid: u32,
 }
 
-pub fn peer_of<F: AsFd>(fd: &F) -> Option<PeerInfo> {
-    let creds = getsockopt(fd, PeerCredentials).ok()?;
-    Some(PeerInfo {
+pub fn peer_of<F: AsFd>(fd: &F) -> nix::Result<PeerInfo> {
+    let creds = getsockopt(fd, PeerCredentials)?;
+    Ok(PeerInfo {
         pid: creds.pid(),
         uid: creds.uid(),
         gid: creds.gid(),
