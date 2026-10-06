@@ -47,6 +47,10 @@ A rule line is a literal command line, tokenised shell-style:
 - The first token is the executable. Bare names go through
   [`exec_path`](#exec_path) at call time. Absolute paths must start
   with `/`.
+- The caller's `argv[0]` must equal the first token exactly: a
+  bare-name rule matches only that bare name, never a path ending in
+  it, and an absolute rule only that exact path string. The binary run
+  is always the one the rule names, resolved by sluice.
 - Subsequent tokens are either *literals* or *slots* (see
   [Slot system](#slot-system)).
 

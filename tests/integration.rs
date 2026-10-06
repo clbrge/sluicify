@@ -392,17 +392,14 @@ fn start_event_records_resolved_binary() {
         "defaults:\n  audit = best-effort\n  logfile = $DIR/manifest.jsonl\n\n\
          echo #1\n  1 = ^[a-z]+$\n",
     );
-    let (code, _, _) = broker.call(&["/tmp/anything/echo", "hi"]);
+    let (code, _, _) = broker.call(&["echo", "hi"]);
     assert_eq!(code, 0);
     let manifest = broker.manifest().expect("manifest");
     let start = manifest
         .lines()
         .find(|l| l.contains("\"kind\":\"start\""))
         .expect("start event");
-    assert!(
-        start.contains("\"argv\":[\"/tmp/anything/echo\""),
-        "{start}"
-    );
+    assert!(start.contains("\"argv\":[\"echo\""), "{start}");
     assert!(
         start.contains("\"resolved\":\"/bin/echo\"")
             || start.contains("\"resolved\":\"/usr/bin/echo\""),
@@ -477,4 +474,30 @@ fn client_flags_after_the_socket_belong_to_the_command() {
     let (code, stdout, _) = broker.call(&["printf", "%s\\n", "--version"]);
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "--version");
+}
+
+#[test]
+fn caller_path_for_a_bare_name_rule_is_refused_and_never_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let broker = Broker::start(
+        "defaults:\n  audit = best-effort\n  logfile = $DIR/manifest.jsonl\n\n\
+         echo #1\n  1 = ^[a-z]+$\n",
+    );
+    let planted_dir = broker.dir.join("planted");
+    std::fs::create_dir(&planted_dir).unwrap();
+    let planted = planted_dir.join("echo");
+    let marker = broker.dir.join("planted-ran");
+    std::fs::write(
+        &planted,
+        format!("#!/bin/sh\ntouch {}\necho PLANTED\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, stdout, _) = broker.call(&[planted.to_str().unwrap(), "hi"]);
+    assert_eq!(code, 129, "a path for a bare-name rule must not match");
+    assert!(!stdout.contains("PLANTED"));
+    assert!(!marker.exists(), "the caller's binary ran");
+    let manifest = broker.manifest().expect("manifest");
+    assert!(manifest.contains("\"reason\":\"no_rule\""), "{manifest}");
 }

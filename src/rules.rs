@@ -1014,14 +1014,12 @@ impl Rule {
         // Executable
         match &self.exe {
             ExeMatch::BareName(name) => {
-                let argv0 = std::path::Path::new(&argv[0]);
-                let basename = argv0.file_name()?.to_str()?;
-                if basename != name {
+                if argv[0] != *name {
                     return None;
                 }
             }
             ExeMatch::Absolute(p) => {
-                if std::path::Path::new(&argv[0]) != p {
+                if std::ffi::OsStr::new(&argv[0]) != p.as_os_str() {
                     return None;
                 }
             }
@@ -1280,6 +1278,29 @@ mod tests {
     fn attribute_missing_equals_before_comment_rejected() {
         let err = parse("echo\n  timeout ; = 5s\n").unwrap_err();
         assert!(err.message.contains("missing '='"), "{}", err.message);
+    }
+
+    #[test]
+    fn bare_name_rule_matches_only_the_bare_name() {
+        let r = parse("echo #1\n  1 = ^[a-z]+$\n").unwrap();
+        assert!(r.match_argv(&argv(&["echo", "hi"])).is_some());
+        for argv0 in ["/usr/bin/echo", "/tmp/x/echo", "./echo", "bin/echo"] {
+            assert!(r.match_argv(&argv(&[argv0, "hi"])).is_none(), "{argv0}");
+        }
+    }
+
+    #[test]
+    fn absolute_rule_matches_only_the_exact_path() {
+        let r = parse("/usr/bin/echo #1\n  1 = ^[a-z]+$\n").unwrap();
+        assert!(r.match_argv(&argv(&["/usr/bin/echo", "hi"])).is_some());
+        for argv0 in [
+            "echo",
+            "/usr/bin//echo",
+            "/usr/./bin/echo",
+            "/usr/bin/echo/",
+        ] {
+            assert!(r.match_argv(&argv(&[argv0, "hi"])).is_none(), "{argv0}");
+        }
     }
 
     #[test]

@@ -9,6 +9,12 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Changed
+
+- A bare-name rule matches only an `argv[0]` equal to its name, and an
+  absolute rule only its exact path. A caller sending a path for a
+  bare-name rule (`/usr/bin/git` for `git`) now gets `ERR_NO_RULE`.
+
 ## [0.2.2] - 2026-10-05
 
 ### Added
