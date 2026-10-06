@@ -9,6 +9,8 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-06
+
 ### Changed
 
 - A bare-name rule matches only an `argv[0]` equal to its name, and an
@@ -196,7 +198,8 @@ Initial public release. The crate ships two binaries (`sluice` daemon and
 - 56 Rust tests (48 unit + 5 integration + 3 example smoke) + manual
   Node smoke.
 
-[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/clbrge/sluicify/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/clbrge/sluicify/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/clbrge/sluicify/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/clbrge/sluicify/compare/v0.1.0...v0.2.0

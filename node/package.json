@@ -1,6 +1,6 @@
 {
   "name": "sluicify-native",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Native Node.js addon for sluicify (AF_UNIX command broker).",
   "main": "index.js",
   "types": "index.d.ts",

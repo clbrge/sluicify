@@ -1,6 +1,6 @@
 [package]
 name = "sluicify-node"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 authors = ["Christophe Le Bars <clb@toort.net>"]
 description = "Native Node.js addon for the sluicify command broker"
