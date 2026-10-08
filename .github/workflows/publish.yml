@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # Pinned: the .node links against the runner's glibc, which must not
+    # be newer than the hosts' (Debian 13).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

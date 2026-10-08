@@ -5,9 +5,12 @@
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT OR Apache-2.0",
-  "repository": "github:clbrge/sluicify",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clbrge/sluicify.git"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "os": [
     "linux"

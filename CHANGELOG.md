@@ -9,6 +9,10 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Changed
+
+- `sluicify-native` requires Node ≥ 22.
+
 ## [0.3.1] - 2026-10-08
 
 ### Added
