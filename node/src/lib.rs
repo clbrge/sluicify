@@ -8,7 +8,7 @@
 //!
 //! Exposed JS API:
 //!
-//!     const sluice = require('@sluice/native');
+//!     const sluice = require('sluicify-native');
 //!     const status = sluice.call('/run/sluice.sock', ['echo', 'hi']);
 //!
 //! `call` is **synchronous**: it blocks the calling JS thread until the

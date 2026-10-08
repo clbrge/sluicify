@@ -9,6 +9,10 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Added
+
+- `sluicify-native`, the Node addon, is published on npm for linux x64.
+
 ## [0.3.0] - 2026-10-06
 
 ### Changed

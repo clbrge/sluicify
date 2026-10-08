@@ -5,11 +5,15 @@
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT OR Apache-2.0",
+  "repository": "github:clbrge/sluicify",
   "engines": {
     "node": ">=18"
   },
   "os": [
     "linux"
+  ],
+  "cpu": [
+    "x64"
   ],
   "files": [
     "index.js",
