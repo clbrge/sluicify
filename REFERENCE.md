@@ -36,6 +36,9 @@ Line-oriented, whitespace-significant.
   `defaults:` or a *rule line*.
 - An **indented** line (any leading whitespace) is an attribute of the
   preceding stanza, written `key = value`.
+- Unindented comment lines directly above a rule line, with no blank
+  line between, say what the rule is for. `sluicify --list` shows them
+  with the rule; nothing else in the file is shown to a caller.
 
 A rule line is a literal command line, tokenised shell-style:
 
@@ -61,6 +64,7 @@ defaults:
   timeout = 30s
   env     = HOME,PATH,LANG
 
+; The latest commits of the mirror, at most 99.
 git --no-pager -C /srv/mirror/project log --oneline -n #1
   1 = ^[1-9][0-9]?$
 
@@ -492,6 +496,10 @@ ancillary: SCM_RIGHTS = [stdin_fd, stdout_fd, stderr_fd]
 
 Maximum total payload: 1 MiB.
 
+An `argv_count` of `0`, with nothing after it and no fds, asks what the
+socket allows instead of running anything. A broker older than this
+request answers it `ERR_PROTO`.
+
 ### Reply
 
 ```
@@ -499,6 +507,28 @@ u32 magic        = 0x534C4358
 u32 version      = 1
 i32 status
 ```
+
+A listing request's reply goes on, when its status is `0`:
+
+```
+u32 byte_len     ; 0..=65536
+u8[byte_len]     ; UTF-8: one block per rule, in file order
+```
+
+Each block is the rule's command line with every slot shown as
+`<name>`, its comment lines, and what each slot accepts, indented two
+spaces; blocks are separated by a blank line:
+
+```
+git --no-pager -C /srv/mirror/project log --oneline -n <1>
+  The latest commits of the mirror, at most 99.
+  <1> matches ^[1-9][0-9]?$
+```
+
+A slot in `allow_dash` adds `, and may start with -`; a slot in
+`allow_any` reads `<name> is any value`. A literal that is not one plain
+word is single-quoted, so it cannot read as a slot. Attributes (`env`,
+`cwd`, paths, `timeout`, `log`) are never shown.
 
 Status interpretation:
 
@@ -512,6 +542,7 @@ Status interpretation:
 | `-6` (`ERR_AUDIT`)     | audit refused under strict mode                         |
 | `-7` (`ERR_TIMEOUT`)   | rule `timeout` fired; child was killed                  |
 | `-8` (`ERR_PEER`)      | caller's `SO_PEERCRED` unreadable                       |
+| `-9` (`ERR_TOO_LARGE`) | the listing is longer than 64 KiB                       |
 
 `-5` is no longer sent; signal deaths are `128 + signo`.
 
@@ -527,7 +558,7 @@ so shell pipelines can branch on them.
 
 ## CLI
 
-### `sluice check <rules-file>`
+### `sluice check <rules-file>` · `sluice check --rules-dir <dir>`
 
 Parse the file and report rule count and exe shape per rule. Then list
 every slot widened with `allow_any` or `allow_dash`, and warn about a
@@ -541,6 +572,10 @@ ok: 5 rule(s)
   line  10: BareName("git")  tokens=4  slots=1
   ...
 ```
+
+With `--rules-dir`, every `<name>.rules` in the directory is checked
+the same way under a `<name>:` heading, and a file name that `serve
+--rules-dir` would refuse is reported. Returns 1 if any file fails.
 
 ### `sluice match <rules-file> <argv...>`
 
@@ -567,6 +602,46 @@ The broker:
 - Binds with `umask 0077` so the socket file is mode 0600.
 - `SIGHUP` → reload rules + reopen manifest + clear sink cache.
 - Exits with code 2 on configuration error, runs forever otherwise.
+
+### `sluice serve --rules-dir <dir> --socket-dir <dir>`
+
+Serve every `<name>.rules` in the rules directory, each on its own
+socket, `<socket-dir>/<name>/sluice.sock`, from one process. For
+several sets of callers that each need their own rules: one sandbox
+per agent, per project, per CI job.
+
+- `<name>` is letters, digits, `.`, `-` and `_`. A file named otherwise
+  is reported once and not served; dotfiles, which editors leave
+  behind, and files not ending in `.rules` are ignored.
+- The socket directory, and each `<name>/` in it, is made at mode 0700
+  when missing. The broker refuses to start on a socket directory that
+  is not its uid's or that another uid can write.
+- Bind-mount `<socket-dir>/<name>/`, not the socket file, into the
+  sandbox: a restart recreates the socket, which a directory mount sees
+  and a file mount does not.
+- The directory is rescanned every second. A file added is served, a
+  file changed is reloaded (as `SIGHUP` reloads `--rules`), and a file
+  removed has its socket and its `<name>/` removed. Calls already
+  running finish.
+- A file that does not parse, or whose socket cannot be bound, is not
+  served, and the others are. It is tried again once it changes.
+- `SIGHUP` reloads every file, which also reopens each manifest.
+- Each file's own `defaults:` apply to its socket, `logfile` included.
+  Call ids are unique across the process, so files may share a
+  manifest.
+
+```ini
+ExecStart=%h/.local/bin/sluice serve \
+    --rules-dir  %h/.config/sluice/sandboxes \
+    --socket-dir %t/sluice/sandboxes
+```
+
+### `sluicify --list <socket>`
+
+Print what the socket allows: the listing described under
+[Wire protocol](#wire-protocol). Exits 0, `128 + |status|` when the
+broker refuses (`130` from a broker that predates listing), or 2 when
+no broker answers. `sluicify-native` has the same as `list(socket)`.
 
 #### User-level systemd unit (laptop / dev workstation)
 
@@ -642,6 +717,7 @@ follow the convention `128 + |sluice_error|`:
 | `-6`          | `134`              | audit refused (strict)        |
 | `-7`          | `124`              | rule timeout fired            |
 | `-8`          | `136`              | caller identity unreadable    |
+| `-9`          | `137`              | listing too large (`--list`)  |
 
 ---
 

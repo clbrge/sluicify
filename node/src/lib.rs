@@ -10,6 +10,7 @@
 //!
 //!     const sluice = require('sluicify-native');
 //!     const status = sluice.call('/run/sluice.sock', ['echo', 'hi']);
+//!     const allowed = sluice.list('/run/sluice.sock');
 //!
 //! `call` is **synchronous**: it blocks the calling JS thread until the
 //! broker replies. The spawned child uses your Node process's stdio, so
@@ -23,7 +24,9 @@ use nix::sys::socket::{
     connect, recvmsg, sendmsg, socket, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType,
     UnixAddr,
 };
-use sluicify::proto::{MAGIC, VERSION};
+use sluicify::proto::{
+    decode_list_reply, encode_list_request, ListReply, ERR_PROTO, MAGIC, MAX_LISTING, VERSION,
+};
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -87,4 +90,50 @@ pub fn call(socket_path: String, argv: Vec<String>) -> Result<i32> {
         )));
     }
     Ok(status)
+}
+
+/// What the socket allows, as the broker lists its rules. Throws when the
+/// broker cannot be reached, refuses, or predates listing.
+#[napi]
+pub fn list(socket_path: String) -> Result<String> {
+    let sock: OwnedFd = socket(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .map_err(|e| Error::from_reason(format!("socket: {e}")))?;
+    let addr = UnixAddr::new(socket_path.as_str())
+        .map_err(|e| Error::from_reason(format!("invalid socket path: {e}")))?;
+    connect(sock.as_raw_fd(), &addr)
+        .map_err(|e| Error::from_reason(format!("connect {socket_path}: {e}")))?;
+
+    let request = encode_list_request();
+    sendmsg::<UnixAddr>(
+        sock.as_raw_fd(),
+        &[IoSlice::new(&request)],
+        &[],
+        MsgFlags::empty(),
+        None,
+    )
+    .map_err(|e| Error::from_reason(format!("sendmsg: {e}")))?;
+
+    let mut reply = vec![0u8; MAX_LISTING + 64];
+    let mut iov = [IoSliceMut::new(&mut reply)];
+    let msg = recvmsg::<UnixAddr>(sock.as_raw_fd(), &mut iov, None, MsgFlags::empty())
+        .map_err(|e| Error::from_reason(format!("recvmsg: {e}")))?;
+    let n = msg.bytes;
+    if msg.flags.contains(MsgFlags::MSG_TRUNC) {
+        return Err(Error::from_reason("the listing did not fit in one reply"));
+    }
+    match decode_list_reply(&reply[..n]) {
+        Ok(ListReply::Listing(text)) => Ok(text),
+        Ok(ListReply::Refused(ERR_PROTO)) => Err(Error::from_reason(format!(
+            "the broker at {socket_path} cannot list its rules (it predates listing)"
+        ))),
+        Ok(ListReply::Refused(status)) => Err(Error::from_reason(format!(
+            "the broker refused to list its rules (status {status})"
+        ))),
+        Err(e) => Err(Error::from_reason(format!("bad reply: {e:?}"))),
+    }
 }

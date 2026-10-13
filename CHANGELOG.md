@@ -9,9 +9,23 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Added
+
+- `sluice serve --rules-dir <dir> --socket-dir <dir>` serves every
+  `<name>.rules` on its own socket, `<socket-dir>/<name>/sluice.sock`,
+  from one process, and follows files added, changed and removed.
+- `sluice check --rules-dir <dir>`.
+- A listing request: `sluicify --list <socket>` and `list()` in
+  `sluicify-native` print each rule's command line, the comment lines
+  above it, and what each slot accepts.
+- `ERR_TOO_LARGE` (`-9`): a listing longer than 64 KiB.
+
 ### Changed
 
 - `sluicify-native` requires Node ≥ 22.
+- A request with no arguments is a listing request; it was `ERR_PROTO`.
+- The broker says `reloaded <file>` after `SIGHUP`, where it said
+  `reload OK`.
 
 ## [0.3.1] - 2026-10-08
 

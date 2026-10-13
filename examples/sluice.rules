@@ -20,6 +20,8 @@
 ;     literal is data. An attribute value that starts with a quote is
 ;     one quoted word (1 = '^a;b$'); otherwise write a literal ';' as \;.
 ;   - First match wins.
+;   - Comment lines directly above a rule, with no blank line between,
+;     say what it is for: `sluicify --list <socket>` shows them with it.
 ;
 ; Audit:
 ;   - logfile     — JSONL manifest of structured events (start, exit,

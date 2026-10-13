@@ -501,3 +501,237 @@ fn caller_path_for_a_bare_name_rule_is_refused_and_never_run() {
     let manifest = broker.manifest().expect("manifest");
     assert!(manifest.contains("\"reason\":\"no_rule\""), "{manifest}");
 }
+
+#[test]
+fn list_shows_what_the_socket_allows() {
+    let broker = Broker::start(
+        "; The broker's own header.\n\ndefaults:\n  audit = best-effort\n  env = HOME\n\n\
+         ; Say a word back.\necho #word\n  word = [a-z]+\n",
+    );
+    let out = Command::new(SLUICIFY_BIN)
+        .arg("--list")
+        .arg(&broker.socket)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "echo <word>\n  Say a word back.\n  <word> matches [a-z]+\n"
+    );
+
+    let none = Command::new(SLUICIFY_BIN).arg("--list").output().unwrap();
+    assert_eq!(none.status.code(), Some(2));
+    let two = Command::new(SLUICIFY_BIN)
+        .arg("--list")
+        .arg(&broker.socket)
+        .arg("echo")
+        .output()
+        .unwrap();
+    assert_eq!(two.status.code(), Some(2));
+}
+
+/// `sluice serve --rules-dir <dir>/rules --socket-dir <dir>/sockets`.
+struct DirBroker {
+    child: Option<Child>,
+    rules: PathBuf,
+    sockets: PathBuf,
+    dir: PathBuf,
+}
+
+impl DirBroker {
+    fn start(files: &[(&str, &str)]) -> Self {
+        let dir = tempdir_0700();
+        let rules = dir.join("rules");
+        std::fs::create_dir(&rules).unwrap();
+        for (name, text) in files {
+            std::fs::write(rules.join(name), text).unwrap();
+        }
+        let sockets = dir.join("sockets");
+        let child = Command::new(SLUICE_BIN)
+            .arg("serve")
+            .arg("--rules-dir")
+            .arg(&rules)
+            .arg("--socket-dir")
+            .arg(&sockets)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sluice");
+        DirBroker {
+            child: Some(child),
+            rules,
+            sockets,
+            dir,
+        }
+    }
+
+    fn socket(&self, name: &str) -> PathBuf {
+        self.sockets.join(name).join("sluice.sock")
+    }
+
+    fn call(&self, name: &str, argv: &[&str]) -> i32 {
+        Command::new(SLUICIFY_BIN)
+            .arg(self.socket(name))
+            .args(argv)
+            .output()
+            .expect("run sluicify")
+            .status
+            .code()
+            .unwrap_or(-1)
+    }
+
+    /// Stops the broker and returns what it wrote on stderr.
+    fn stop(mut self) -> String {
+        let mut child = self.child.take().unwrap();
+        let _ = child.kill();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+}
+
+impl Drop for DirBroker {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A rescan picks a change up within a second.
+const SOON: Duration = Duration::from_secs(5);
+
+fn within(limit: Duration, ready: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ready()
+}
+
+const ECHO_LOWER: &str = "defaults:\n  audit = best-effort\n\necho #1\n  1 = [a-z]+\n";
+const ECHO_DIGITS: &str = "defaults:\n  audit = best-effort\n\necho #1\n  1 = [0-9]{1,9}\n";
+
+#[test]
+fn rules_dir_serves_each_file_on_a_socket_of_its_own() {
+    use std::os::unix::fs::PermissionsExt;
+    let broker = DirBroker::start(&[("lower.rules", ECHO_LOWER), ("digits.rules", ECHO_DIGITS)]);
+    let serves = |name: &str| broker.socket(name).exists();
+    assert!(within(SOON, || serves("lower") && serves("digits")));
+
+    assert_eq!(broker.call("lower", &["echo", "abc"]), 0);
+    assert_eq!(broker.call("lower", &["echo", "123"]), 129);
+    assert_eq!(broker.call("digits", &["echo", "123"]), 0);
+    assert_eq!(broker.call("digits", &["echo", "abc"]), 129);
+
+    let mode = std::fs::metadata(broker.sockets.join("lower"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+#[test]
+fn rules_dir_follows_files_added_changed_and_removed() {
+    let broker = DirBroker::start(&[("one.rules", ECHO_LOWER)]);
+    let serves = |name: &str| broker.socket(name).exists();
+    assert!(within(SOON, || serves("one")));
+
+    std::fs::write(broker.rules.join("two.rules"), ECHO_DIGITS).unwrap();
+    assert!(within(SOON, || serves("two")));
+    assert_eq!(broker.call("two", &["echo", "42"]), 0);
+
+    std::fs::write(broker.rules.join("one.rules"), ECHO_DIGITS).unwrap();
+    let takes_digits = || broker.call("one", &["echo", "42"]) == 0;
+    assert!(within(SOON, takes_digits));
+    assert_eq!(broker.call("one", &["echo", "abc"]), 129);
+
+    std::fs::remove_file(broker.rules.join("two.rules")).unwrap();
+    let gone = || !broker.sockets.join("two").exists();
+    assert!(within(SOON, gone));
+    assert_eq!(broker.call("one", &["echo", "7"]), 0);
+}
+
+#[test]
+fn rules_dir_serves_the_good_files_beside_one_that_does_not_parse() {
+    let broker = DirBroker::start(&[
+        ("good.rules", ECHO_LOWER),
+        ("bad.rules", "echo #1\n"),
+        ("bad name.rules", ECHO_LOWER),
+        (".hidden.rules", ECHO_LOWER),
+        ("notes.txt", "not rules"),
+    ]);
+    let serves = |name: &str| broker.socket(name).exists();
+    assert!(within(SOON, || serves("good")));
+    assert_eq!(broker.call("good", &["echo", "abc"]), 0);
+    assert!(!broker.sockets.join("bad").exists());
+    assert!(!broker.sockets.join(".hidden").exists());
+    assert!(!broker.sockets.join("notes").exists());
+
+    std::fs::write(broker.rules.join("bad.rules"), ECHO_LOWER).unwrap();
+    assert!(within(SOON, || serves("bad")));
+    assert_eq!(broker.call("bad", &["echo", "abc"]), 0);
+
+    let said = broker.stop();
+    assert!(said.contains("bad: parse error"), "{said}");
+    assert_eq!(
+        said.matches("cannot be named \"bad name\"").count(),
+        1,
+        "said once: {said}"
+    );
+}
+
+#[test]
+fn check_takes_a_rules_dir_and_fails_on_any_bad_file() {
+    let dir = tempdir_0700();
+    std::fs::write(dir.join("a.rules"), ECHO_LOWER).unwrap();
+    let check = || {
+        Command::new(SLUICE_BIN)
+            .arg("check")
+            .arg("--rules-dir")
+            .arg(&dir)
+            .output()
+            .unwrap()
+    };
+    let ok = check();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ok.stdout).starts_with("a:\nok: 1 rule(s)"));
+
+    std::fs::write(dir.join("b.rules"), "echo #1\n").unwrap();
+    assert_eq!(check().status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_takes_one_file_or_one_directory() {
+    let out = Command::new(SLUICE_BIN)
+        .args([
+            "serve",
+            "--rules",
+            "/nonexistent/r",
+            "--socket-dir",
+            "/nonexistent/s",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let out = Command::new(SLUICE_BIN)
+        .args(["serve", "--rules-dir", "/nonexistent/r"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

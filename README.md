@@ -9,7 +9,9 @@ via `SCM_RIGHTS` fd-passing.
 The crate ships two binaries:
 
 - **`sluice`** — the broker daemon (`sluice serve`, `sluice check`,
-  `sluice match`). One running daemon per sandbox.
+  `sluice match`). One rules file per socket: every caller that can
+  reach a socket gets that socket's rules. A daemon serves one file, or
+  a directory of them, one socket each.
 - **`sluicify`** — the verb. The client callers in the sandbox use to
   hand commands to the daemon (`sluicify <socket> <cmd> [args...]`).
 
@@ -51,9 +53,12 @@ Three things make it useful:
   identity, it explicitly invokes `sudo` / `ssh` / `doas` / `pkexec` —
   and those tools' own policies (sudoers, authorized_keys, polkit) are
   what decide.
-- **Not an auth system.** Identity is "which socket you can reach". One
-  socket per sandbox; the bind-mount is the credential. `SO_PEERCRED`
-  is a sanity check, not the auth mechanism.
+- **Not an auth system.** Identity is "which socket you can reach".
+  Reaching the socket, through a bind-mount or the socket file's
+  permissions, is the credential, and everyone who can reach it shares
+  one rules file. Give each set of callers that needs its own rules its
+  own socket — a file of its own under `serve --rules-dir`.
+  `SO_PEERCRED` is a sanity check, not the auth mechanism.
 - **Not a network service.** AF_UNIX only. You bind-mount the socket
   into the sandbox.
 - **Not a way to grant a shell** — on purpose. A rule whitelists *one
@@ -88,7 +93,7 @@ per-rule procedure to follow before a rule goes live.
 | `sudo` / `doas`            | Caller invokes a privileged tool in their PATH     | sluice keeps zero binaries in the sandbox; just a socket |
 | `sshd` + `ForceCommand`    | Per-key allowed command in `authorized_keys`       | sluice is local-only, declarative per-arg regex          |
 | `flatpak-spawn` / portals  | Sandboxed app asks D-Bus portal to spawn on host   | sluice is sandbox-agnostic; AF_UNIX, no D-Bus            |
-| `polkit` / `pkexec`        | Session-mediated privilege requests                | sluice is path-driven (one socket per sandbox)           |
+| `polkit` / `pkexec`        | Session-mediated privilege requests                | sluice is path-driven (one socket, one rules file)       |
 | `runc exec` / `docker exec`| Outside → spawns into container                    | sluice is the reverse: inside → spawns outside           |
 | `ssh-agent` / `nix-daemon` | Single-purpose SCM_RIGHTS broker                   | same architecture, sluice generalizes it                 |
 
@@ -368,6 +373,17 @@ $ echo $?
 A rule timeout exits `124` (as GNU `timeout`); a child killed by a
 signal exits `128 + signo`.
 
+A caller can ask what the socket allows. The comment lines written
+directly above a rule say what it is for; the rest of the rules file
+(env, paths, logging) stays out of it:
+
+```sh
+$ sluicify --list /run/agent.sock
+systemctl --user --no-pager status <unit>
+  How one of the dev services is doing.
+  <unit> matches (api|worker)\.service
+```
+
 ### 6. Inspect the audit log
 
 Every accepted call shows up as a `start`/`exit` pair in the manifest;
@@ -406,7 +422,7 @@ the commits in the review clone, not by the sidecars.
 ```sh
 $ kill -HUP $(pgrep -u "$USER" sluice)
 sluice: SIGHUP — reloading rules
-sluice: reload OK
+sluice: reloaded /home/you/.config/sluice/agent.rules
 ```
 
 ### 7. Build it
@@ -426,6 +442,31 @@ That's it. See `REFERENCE.md` for the full attribute list, slot system,
 wire protocol, and production checklist.
 
 ---
+
+## Several sandboxes, one broker
+
+When each sandbox needs its own rules (one per agent, project or CI
+job), one daemon serves a directory of rules files, one socket each:
+
+```sh
+sluice serve \
+    --rules-dir  ~/.config/sluice/sandboxes \
+    --socket-dir "$XDG_RUNTIME_DIR/sluice/sandboxes"
+```
+
+`sandboxes/review.rules` is served at
+`$XDG_RUNTIME_DIR/sluice/sandboxes/review/sluice.sock`. Bind-mount the
+`review/` directory, not the socket, so that a broker restart reaches
+the sandbox:
+
+```sh
+bwrap … --bind "$XDG_RUNTIME_DIR/sluice/sandboxes/review" /run/sluice …
+```
+
+Adding, editing or removing a file takes effect within a second, with
+no restart. A file that does not parse is left unserved while the
+others keep running. `sluice check --rules-dir` checks them all. Details
+in [REFERENCE.md](REFERENCE.md#sluice-serve---rules-dir-dir---socket-dir-dir).
 
 ## Where to look next
 

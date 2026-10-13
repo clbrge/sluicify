@@ -182,6 +182,9 @@ pub struct Defaults {
 #[derive(Debug)]
 pub struct Rule {
     pub line_no: usize,
+    /// The comment lines written directly above the rule, with no blank
+    /// line between: what the rule is for, as `Rules::listing` shows it.
+    pub about: Vec<String>,
     pub exe: ExeMatch,
     pub tokens: Vec<TokenPattern>,
     pub slot_regex: HashMap<SlotId, Regex>,
@@ -243,10 +246,12 @@ pub fn parse(input: &str) -> Result<Rules, ParseError> {
     let mut defaults = Defaults::default();
     let mut rules: Vec<Rule> = Vec::new();
     let mut current: Stanza = Stanza::None;
+    let mut about: Vec<String> = Vec::new();
 
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
         if raw.starts_with([' ', '\t']) {
+            about.clear();
             if let Some((key, val)) = split_attr(raw, line_no)? {
                 apply_attr(&mut current, &mut defaults, &mut rules, key, &val, line_no)?;
             }
@@ -254,14 +259,21 @@ pub fn parse(input: &str) -> Result<Rules, ParseError> {
         }
         let stripped = strip_comment(raw);
         if stripped.trim().is_empty() {
+            match raw.strip_prefix(';').map(str::trim) {
+                Some("") => {}
+                Some(text) => about.push(text.to_string()),
+                None => about.clear(),
+            }
             continue;
         }
         // New stanza
         let trimmed = stripped.trim_end();
         if trimmed == "defaults:" {
+            about.clear();
             current = Stanza::Defaults;
         } else {
-            let rule = parse_rule_line(trimmed, line_no)?;
+            let mut rule = parse_rule_line(trimmed, line_no)?;
+            rule.about = std::mem::take(&mut about);
             rules.push(rule);
             current = Stanza::Rule(rules.len() - 1);
         }
@@ -724,6 +736,27 @@ fn anchor_regex(re: &str) -> String {
     format!("^(?:{re})$")
 }
 
+/// The regex as the rules file wrote it, without the anchoring `anchor_regex` added.
+fn unanchored(re: &Regex) -> &str {
+    let full = re.as_str();
+    full.strip_prefix("^(?:")
+        .and_then(|r| r.strip_suffix(")$"))
+        .unwrap_or(full)
+}
+
+/// A literal as one shell word, quoted only when it has to be, so a
+/// listing never shows a literal that reads as a slot or as two words.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 fn parse_duration(val: &str, line_no: usize) -> Result<Duration, ParseError> {
     let v = val.trim();
     let (num_part, unit) = v
@@ -858,6 +891,7 @@ fn parse_rule_line(line: &str, line_no: usize) -> Result<Rule, ParseError> {
     }
     Ok(Rule {
         line_no,
+        about: Vec::new(),
         exe,
         tokens,
         slot_regex: HashMap::new(),
@@ -955,6 +989,42 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<String>, ParseError> {
 // ---------------------------------------------------------------------------
 
 impl Rules {
+    /// What a caller may ask for, one block per rule in file order: the
+    /// command with each slot shown as `<name>`, the rule's `about` lines,
+    /// then what each slot accepts. Nothing else about a rule is shown —
+    /// its env, paths, timeout and logging stay the operator's.
+    pub fn listing(&self) -> String {
+        let mut out = String::new();
+        for (i, r) in self.rules.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&r.pattern());
+            out.push('\n');
+            for line in &r.about {
+                out.push_str(&format!("  {line}\n"));
+            }
+            for slot in r.slots() {
+                let name = slot_key(slot);
+                if r.allow_any.contains(slot) {
+                    out.push_str(&format!("  <{name}> is any value\n"));
+                    continue;
+                }
+                let re = r
+                    .slot_regex
+                    .get(slot)
+                    .expect("validate_slots gives every slot a regex or allow_any");
+                let dash = if r.allow_dash.contains(slot) {
+                    ", and may start with -"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("  <{name}> matches {}{dash}\n", unanchored(re)));
+            }
+        }
+        out
+    }
+
     /// First matching rule wins. Returns `None` if no rule matches.
     pub fn match_argv<'r>(&'r self, argv: &[String]) -> Option<Match<'r>> {
         self.check_argv(argv).ok()
@@ -989,6 +1059,22 @@ enum Tried<'r> {
 }
 
 impl Rule {
+    /// The command line a caller sends, each slot shown as `<name>`.
+    pub fn pattern(&self) -> String {
+        let exe = match &self.exe {
+            ExeMatch::BareName(name) => shell_word(name),
+            ExeMatch::Absolute(path) => shell_word(&path.to_string_lossy()),
+        };
+        let mut words = vec![exe];
+        for t in &self.tokens {
+            words.push(match t {
+                TokenPattern::Literal(lit) => shell_word(lit),
+                TokenPattern::Slot(id) => format!("<{}>", slot_key(id)),
+            });
+        }
+        words.join(" ")
+    }
+
     pub fn slots(&self) -> impl Iterator<Item = &SlotId> {
         self.tokens.iter().filter_map(|t| match t {
             TokenPattern::Slot(id) => Some(id),
@@ -1541,5 +1627,48 @@ mod tests {
             r.rules[0].stdoutfile.as_ref().unwrap().raw,
             "/var/log/sluice$.out"
         );
+    }
+
+    #[test]
+    fn comment_lines_directly_above_a_rule_say_what_it_is_for() {
+        let src = "; header\n\ndefaults:\n  timeout = 5s\n\n\
+                   ; How a service is doing.\n; Read-only.\nsystemctl status #unit\n  unit = shop\\.service\n  ; not about\n\n\
+                   ; Detached by a blank line.\n\ngit log\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.rules[0].about,
+            vec!["How a service is doing.", "Read-only."]
+        );
+        assert!(r.rules[1].about.is_empty());
+
+        let r = parse("; header\ndefaults:\n  timeout = 5s\ngit log\n").unwrap();
+        assert!(r.rules[0].about.is_empty());
+    }
+
+    #[test]
+    fn listing_shows_each_rule_its_purpose_and_what_its_slots_accept() {
+        let src = "defaults:\n  env = HOME\n\n\
+                   ; How a service is doing.\nsystemctl --user status #unit\n  unit = (shop|worker)\\.service\n  timeout = 5s\n\n\
+                   printf '%s\\n' #1 #rest\n  1 = ^-[a-z]+$\n  allow_dash = 1\n  allow_any = rest\n\n\
+                   /usr/bin/echo '<not a slot>' 'it''s'\n";
+        let r = parse(src).unwrap();
+        assert_eq!(
+            r.listing(),
+            "systemctl --user status <unit>\n\
+             \x20 How a service is doing.\n\
+             \x20 <unit> matches (shop|worker)\\.service\n\
+             \n\
+             printf '%s\\n' <1> <rest>\n\
+             \x20 <1> matches ^-[a-z]+$, and may start with -\n\
+             \x20 <rest> is any value\n\
+             \n\
+             /usr/bin/echo '<not a slot>' its\n"
+        );
+    }
+
+    #[test]
+    fn listing_quotes_a_literal_with_a_quote_in_it() {
+        let r = parse("echo \"it's\"\n").unwrap();
+        assert_eq!(r.listing(), "echo 'it'\\''s'\n");
     }
 }

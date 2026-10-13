@@ -41,6 +41,7 @@ writeFileSync(rules, [
   '  audit = best-effort',
   '  env   = HOME,LANG',
   '',
+  '; Say a word back.',
   'echo #1',
   '  1 = ^[a-zA-Z0-9_]+$',
 ].join('\n'));
@@ -85,6 +86,18 @@ function main() {
     cleanup(1, `expected status 0, got ${status}`);
     return;
   }
-  console.log('OK: native addon round-trip succeeded');
+  let listed;
+  try {
+    listed = sluice.list(sock);
+  } catch (e) {
+    cleanup(1, `sluice.list threw: ${e.message}`);
+    return;
+  }
+  const expected = 'echo <1>\n  Say a word back.\n  <1> matches ^[a-zA-Z0-9_]+$\n';
+  if (listed !== expected) {
+    cleanup(1, `expected the listing ${JSON.stringify(expected)}, got ${JSON.stringify(listed)}`);
+    return;
+  }
+  console.log('OK: native addon round-trip and listing succeeded');
   cleanup(0);
 }
