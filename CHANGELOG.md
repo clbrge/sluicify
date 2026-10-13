@@ -9,6 +9,8 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
 ### Added
 
 - `sluice serve --rules-dir <dir> --socket-dir <dir>` serves every
@@ -222,7 +224,8 @@ Initial public release. The crate ships two binaries (`sluice` daemon and
 - 56 Rust tests (48 unit + 5 integration + 3 example smoke) + manual
   Node smoke.
 
-[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/clbrge/sluicify/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/clbrge/sluicify/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/clbrge/sluicify/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/clbrge/sluicify/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/clbrge/sluicify/compare/v0.2.1...v0.2.2
