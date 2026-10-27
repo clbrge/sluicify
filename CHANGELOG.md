@@ -9,6 +9,11 @@ breaking changes (and will be called out under **Changed** with a note).
 
 ## [Unreleased]
 
+### Added
+
+- `sluicify-native` installs and runs on arm64 Linux as on x64: the package carries both
+  addons, each built and smoke-tested against a live broker on a runner of its architecture.
+
 ## [0.4.0] - 2026-10-13
 
 ### Added
